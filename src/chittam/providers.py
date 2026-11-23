@@ -7,8 +7,9 @@ import io
 import logging
 import os
 import re
+import threading
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Callable, Protocol, runtime_checkable
 
 import httpx
 import numpy as np
@@ -204,9 +205,12 @@ class OllamaEmbeddingProvider:
         self.base_url = (base_url or local_cfg.ollama_base_url).rstrip("/")
         self.model_name = model or local_cfg.embedding_model
         self.embedding_dim = embedding_dim if embedding_dim is not None else local_cfg.embedding_dim
-        self.matryoshka_dim = (
-            matryoshka_dim if matryoshka_dim is not None else local_cfg.matryoshka_dim
-        )
+        if matryoshka_dim is not None:
+            self.matryoshka_dim = matryoshka_dim
+        elif config is None and embedding_dim is not None:
+            self.matryoshka_dim = None
+        else:
+            self.matryoshka_dim = local_cfg.matryoshka_dim
         self.timeout_seconds = (
             timeout_seconds if timeout_seconds is not None else local_cfg.timeout_seconds
         )
@@ -559,3 +563,122 @@ def build_vision_provider(cfg: AppConfig, use_external: bool = False) -> VisionP
             model=ext.vision_model.strip() or cfg.local_provider.vision_model,
         )
     raise ValueError(f"Unsupported external provider_type: {ext.provider_type}")
+
+
+DEFAULT_RERANK_MODEL = "ms-marco-MiniLM-L-12-v2"
+_RANKER_CACHE: dict[tuple[str, str], Any] = {}
+_RANKER_CACHE_LOCK = threading.Lock()
+
+
+class _SimpleRerankRequest:
+    def __init__(self, query: str, passages: list[dict[str, Any]]) -> None:
+        self.query = query
+        self.passages = passages
+
+
+class FlashRankRerankProvider:
+    """Local ONNX cross-encoder reranker backed by flashrank with cached model instances."""
+
+    def __init__(
+        self,
+        model_name: str = DEFAULT_RERANK_MODEL,
+        *,
+        cache_dir: Path | str | None = None,
+        max_length: int = 512,
+        ranker: Any | None = None,
+    ) -> None:
+        self.model_name = model_name or DEFAULT_RERANK_MODEL
+        self.cache_dir = (
+            Path(cache_dir).expanduser()
+            if cache_dir is not None
+            else Path("~/.local/share/chittam/models/flashrank").expanduser()
+        )
+        self.max_length = int(max_length)
+        self._ranker = ranker
+
+    def _get_ranker(self) -> Any:
+        if self._ranker is not None:
+            return self._ranker
+        key = (self.model_name, str(self.cache_dir))
+        with _RANKER_CACHE_LOCK:
+            cached = _RANKER_CACHE.get(key)
+            if cached is not None:
+                self._ranker = cached
+                return cached
+            from flashrank import Ranker
+
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            instance = Ranker(
+                model_name=self.model_name,
+                cache_dir=str(self.cache_dir),
+                max_length=self.max_length,
+            )
+            _RANKER_CACHE[key] = instance
+            self._ranker = instance
+            return instance
+
+    def rerank(
+        self, query: str, documents: list[str], top_k: int | None = None
+    ) -> list[tuple[int, float]]:
+        """Score query against candidate passages and return [(idx, score), ...] descending."""
+        if not documents:
+            return []
+        passages = [{"id": idx, "text": doc} for idx, doc in enumerate(documents)]
+        try:
+            from flashrank import RerankRequest
+
+            req = RerankRequest(query=query, passages=passages)
+        except ImportError:
+            req = _SimpleRerankRequest(query=query, passages=passages)
+
+        ranker = self._get_ranker()
+        raw_results = ranker.rerank(req)
+        scored: list[tuple[int, float]] = [
+            (int(item["id"]), float(item.get("score", 0.0))) for item in raw_results
+        ]
+        scored.sort(key=lambda pair: pair[1], reverse=True)
+        if top_k is not None and top_k > 0:
+            return scored[:top_k]
+        return scored
+
+
+def build_rerank_provider(cfg: AppConfig) -> RerankProvider | None:
+    """Return configured local cross-encoder reranker if enabled & installed, else None."""
+    model_name = (cfg.local_provider.rerank_model or "").strip()
+    if not model_name:
+        return None
+    cache_dir = Path(cfg.data_dir).expanduser() / "models" / "flashrank"
+    try:
+        import flashrank  # noqa: F401
+    except ImportError:
+        logger.warning(
+            "rerank_model=%s configured, but 'flashrank' is not installed (install chittam[rerank])",
+            model_name,
+        )
+        return None
+    return FlashRankRerankProvider(model_name=model_name, cache_dir=cache_dir)
+
+
+def build_query_embedding_provider(
+    cfg: AppConfig,
+    index_meta: dict[str, str] | None = None,
+    *,
+    provider_builder: Callable[[AppConfig, bool], EmbeddingProvider] | None = None,
+) -> EmbeddingProvider:
+    """Select an EmbeddingProvider whose source & dimension match the stored vector index."""
+    meta = index_meta or {}
+    source = meta.get("active_embedding_source", "local")
+    dim_raw = meta.get("active_embedding_dim")
+    eff_cfg = cfg.model_copy(deep=True)
+
+    if dim_raw and str(dim_raw).isdigit() and int(dim_raw) > 0:
+        eff_cfg.local_provider.matryoshka_dim = int(dim_raw)
+
+    use_external = (
+        source == "external"
+        and cfg.external_provider.enabled
+        and cfg.external_provider.user_consented
+    )
+    builder = provider_builder or build_embedding_provider
+    return builder(eff_cfg, use_external=use_external)
+

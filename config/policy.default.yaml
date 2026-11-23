@@ -83,14 +83,24 @@ privacy:
   max_images_per_sync: 15
   max_code_files_per_repo: 250
   max_embed_chunks_per_sync: 6000
+  embed_tiers:
+    - active
+    - reference
+  embed_always_media:
+    - image
+    - transcript
+    - pdf
+    - decision
 
 local_provider:
   ollama_base_url: http://127.0.0.1:11434
   embedding_model: embeddinggemma:latest
   embedding_dim: 768
-  matryoshka_dim: null
+  matryoshka_dim: 256
+  vector_dtype: i8
   vision_model: qwen3-vl:2b
   rerank_model: null
+  rerank_top_k: 20
   timeout_seconds: 90.0
 
 external_provider:
@@ -115,3 +125,4 @@ harnesses:
 
 enable_leann_bridge: true
 enable_codegraph: true
+vector_backend: usearch

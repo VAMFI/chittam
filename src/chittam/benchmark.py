@@ -35,7 +35,14 @@ from chittam.models import (
     RepoTier,
     SearchResult,
 )
-from chittam.providers import EmbeddingProvider, build_embedding_provider
+from chittam.providers import (
+    DEFAULT_RERANK_MODEL,
+    EmbeddingProvider,
+    FlashRankRerankProvider,
+    RerankProvider,
+    build_query_embedding_provider,
+    build_rerank_provider,
+)
 from chittam.store import ChittamStore
 
 DEFAULT_CASES_PATH = Path("~/.config/chittam/benchmark_cases.yaml").expanduser()
@@ -317,6 +324,8 @@ def run_benchmark(
     store: ChittamStore | None = None,
     embedder: EmbeddingProvider | None = None,
     use_embeddings: bool = True,
+    use_rerank: bool | None = None,
+    reranker: RerankProvider | None = None,
     top_k: int = 5,
     cases: list[BenchmarkCase] | None = None,
 ) -> dict[str, Any]:
@@ -332,11 +341,36 @@ def run_benchmark(
     embedder_status = "provided" if embedder is not None else "disabled"
     if active_embedder is None and use_embeddings:
         try:
-            active_embedder = build_embedding_provider(resolved_cfg)
+            active_embedder = build_query_embedding_provider(
+                resolved_cfg,
+                index_meta=active_store.get_index_meta(),
+            )
             embedder_status = "active"
         except Exception as exc:  # pragma: no cover - defensive fallback
             active_embedder = None
             embedder_status = f"unavailable:{exc}"
+
+    active_reranker = reranker
+    rerank_status = "provided" if reranker is not None else "disabled"
+    if active_reranker is None and use_rerank is not False:
+        active_reranker = build_rerank_provider(resolved_cfg)
+        if active_reranker is None and use_rerank is True:
+            try:
+                import flashrank  # noqa: F401
+
+                active_reranker = FlashRankRerankProvider(
+                    model_name=DEFAULT_RERANK_MODEL,
+                    cache_dir=Path(resolved_cfg.data_dir).expanduser() / "models" / "flashrank",
+                )
+            except Exception as exc:
+                rerank_status = f"unavailable:{exc}"
+        if active_reranker is not None:
+            try:
+                active_reranker.rerank("warmup", ["warmup passage one", "warmup passage two"], top_k=1)
+                rerank_status = f"active:{getattr(active_reranker, 'model_name', DEFAULT_RERANK_MODEL)}"
+            except Exception as exc:
+                rerank_status = f"unavailable:{exc}"
+                active_reranker = None
 
     per_query: list[dict[str, Any]] = []
     latencies_ms: list[float] = []
@@ -355,12 +389,33 @@ def run_benchmark(
                 except Exception as exc:
                     embed_error = str(exc)
 
+            rerank_k = resolved_cfg.local_provider.rerank_top_k
             if case.mode == "threads":
-                results = active_store.recall_threads(case.query, query_vec=q_vec, harness=case.harness, limit=top_k)
+                results = active_store.recall_threads(
+                    case.query,
+                    query_vec=q_vec,
+                    harness=case.harness,
+                    limit=top_k,
+                    reranker=active_reranker,
+                    rerank_top_k=rerank_k,
+                )
             elif case.mode == "image":
-                results = active_store.search(case.query, query_vec=q_vec, limit=top_k, media_type=MediaType.IMAGE)
+                results = active_store.search(
+                    case.query,
+                    query_vec=q_vec,
+                    limit=top_k,
+                    media_type=MediaType.IMAGE,
+                    reranker=active_reranker,
+                    rerank_top_k=rerank_k,
+                )
             else:
-                results = active_store.search(case.query, query_vec=q_vec, limit=top_k)
+                results = active_store.search(
+                    case.query,
+                    query_vec=q_vec,
+                    limit=top_k,
+                    reranker=active_reranker,
+                    rerank_top_k=rerank_k,
+                )
 
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
             latencies_ms.append(elapsed_ms)
@@ -395,6 +450,7 @@ def run_benchmark(
                     "embed_error": embed_error,
                 }
             )
+        store_stats = active_store.get_stats()
     finally:
         if owns_store:
             active_store.close()
@@ -410,6 +466,13 @@ def run_benchmark(
         "p95_ms": round(float(np.percentile(latencies_ms, 95)), 2) if latencies_ms else 0.0,
         "privacy_leakage": privacy_leakage,
         "embedder_status": embedder_status,
+        "rerank_used": active_reranker is not None,
+        "rerank_status": rerank_status,
+        "vector_backend": store_stats.get("vector_backend"),
+        "vector_dim": store_stats.get("vector_dim"),
+        "vector_dtype": store_stats.get("vector_dtype"),
+        "db_size_bytes": store_stats.get("db_size_bytes"),
+        "vector_index_bytes": store_stats.get("vector_index_bytes"),
         "results": per_query,
     }
 
@@ -420,7 +483,7 @@ def run_synthetic_benchmark() -> dict[str, Any]:
         root = Path(td)
         cfg = AppConfig(data_dir=str(root / "data"), config_dir=str(root / "config"))
         embedder = HashingEmbedder()
-        with ChittamStore(cfg.db_path) as store:
+        with ChittamStore(cfg) as store:
             corpus = build_synthetic_corpus(store, cfg, embedder, home=root / "u")
             report = run_benchmark(cfg, store=store, embedder=embedder, cases=build_benchmark_cases())
         report["mode"] = "synthetic"

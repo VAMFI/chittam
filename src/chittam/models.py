@@ -138,6 +138,17 @@ class PrivacyPolicy(BaseModel):
     max_images_per_sync: int = 40
     max_code_files_per_repo: int = 250
     max_embed_chunks_per_sync: int | None = None
+    embed_tiers: list[RepoTier] = Field(
+        default_factory=lambda: [RepoTier.ACTIVE, RepoTier.REFERENCE]
+    )
+    embed_always_media: list[MediaType] = Field(
+        default_factory=lambda: [
+            MediaType.IMAGE,
+            MediaType.TRANSCRIPT,
+            MediaType.PDF,
+            MediaType.DECISION,
+        ]
+    )
 
 
 class LocalProviderConfig(BaseModel):
@@ -146,9 +157,11 @@ class LocalProviderConfig(BaseModel):
     ollama_base_url: str = "http://127.0.0.1:11434"
     embedding_model: str = "embeddinggemma:latest"
     embedding_dim: int = 768
-    matryoshka_dim: int | None = None
+    matryoshka_dim: int | None = 256
+    vector_dtype: Literal["i8", "f16", "f32"] = "i8"
     vision_model: str = "qwen3-vl:2b"
     rerank_model: str | None = None
+    rerank_top_k: int = 20
     timeout_seconds: float = 90.0
 
 
@@ -189,10 +202,15 @@ class AppConfig(BaseModel):
     harnesses: HarnessesConfig = Field(default_factory=HarnessesConfig)
     enable_leann_bridge: bool = True
     enable_codegraph: bool = True
+    vector_backend: Literal["usearch", "numpy"] = "usearch"
 
     @property
     def db_path(self) -> Path:
         return Path(self.data_dir).expanduser() / "memory.db"
+
+    @property
+    def vector_index_path(self) -> Path:
+        return Path(self.data_dir).expanduser() / "vectors.usearch"
 
     @property
     def atlas_path(self) -> Path:
@@ -296,6 +314,8 @@ class SyncStats(BaseModel):
     skipped_excluded: int = 0
     chunks_written: int = 0
     embeddings_computed: int = 0
+    embeddings_deduped: int = 0
+    stat_skipped: int = 0
     images_captioned: int = 0
     images_cached: int = 0
     errors: list[str] = Field(default_factory=list)

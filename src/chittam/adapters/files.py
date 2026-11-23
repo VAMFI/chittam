@@ -11,7 +11,7 @@ from typing import Callable
 import pymupdf
 
 from chittam.atlas import RepoPathIndex
-from chittam.config import is_path_excluded, redact_secrets
+from chittam.config import compile_privacy_policy, is_path_excluded, redact_secrets
 from chittam.models import AppConfig, CanonicalRepo, DocumentRecord, MediaType, RepoTier, SyncStats
 from chittam.adapters import (
     build_contextual_header,
@@ -96,6 +96,14 @@ _TIER_PRIORITY = {
     RepoTier.ACTIVE: 0,
     RepoTier.REFERENCE: 1,
     RepoTier.ARCHIVE: 2,
+}
+
+_DOC_PREFIX_BY_MEDIA: dict[MediaType, str] = {
+    MediaType.MARKDOWN: "file_md",
+    MediaType.TEXT: "file_txt",
+    MediaType.CODE: "file_code",
+    MediaType.PDF: "file_pdf",
+    MediaType.IMAGE: "file_img",
 }
 
 
@@ -549,69 +557,246 @@ def _is_home_root(raw_root: str, resolved_root: Path) -> bool:
         return False
 
 
+def _stamp_file_stat(doc: DocumentRecord, path: Path) -> DocumentRecord:
+    try:
+        st = path.stat()
+        doc.metadata.setdefault("file_mtime_ns", int(st.st_mtime_ns))
+        doc.metadata.setdefault("file_size", int(st.st_size))
+    except OSError:
+        pass
+    return doc
+
+
+def _check_stat_unchanged(
+    real_file: Path,
+    spec: MediaHandler,
+    repo: CanonicalRepo | None,
+    existing_stats: dict[str, tuple[int | None, int | None, str, str, str]] | None,
+    code_counts: dict[str, int],
+    cfg: AppConfig,
+    *,
+    file_stat: os.stat_result | None = None,
+) -> str | None:
+    if not existing_stats:
+        return None
+    prefix = _DOC_PREFIX_BY_MEDIA.get(spec.media_type)
+    if prefix is None:
+        return None
+    candidate_doc_id = make_doc_id(prefix, str(real_file))
+    prev = existing_stats.get(candidate_doc_id)
+    if prev is None:
+        return None
+    prev_mtime_ns, prev_size, _prev_sha, prev_tier, prev_l0 = prev
+    if prev_mtime_ns is None or prev_size is None:
+        return None
+
+    expected_tier = repo.tier.value if repo else RepoTier.REFERENCE.value
+    if prev_tier != expected_tier:
+        return None
+
+    if spec.media_type == MediaType.IMAGE:
+        if not prev_l0 or prev_l0.startswith("[image uncaptioned"):
+            return None
+
+    try:
+        st = file_stat if file_stat is not None else real_file.stat()
+    except OSError:
+        return None
+
+    if int(st.st_mtime_ns) != int(prev_mtime_ns) or int(st.st_size) != int(prev_size):
+        return None
+
+    if spec.media_type == MediaType.CODE and repo is not None:
+        count = code_counts.get(repo.project_id, 0)
+        cap = (
+            min(cfg.privacy.max_code_files_per_repo, 15)
+            if repo.tier == RepoTier.ARCHIVE
+            else cfg.privacy.max_code_files_per_repo
+        )
+        if count >= cap:
+            return None
+        code_counts[repo.project_id] = count + 1
+
+    return candidate_doc_id
+
+
+def load_single_file_doc(
+    path: Path,
+    cfg: AppConfig,
+    atlas: dict[str, CanonicalRepo],
+    *,
+    vision_fn: Callable[[Path, str], str] | None = None,
+    image_cache_lookup: Callable[[str], str | None] | None = None,
+    stats: SyncStats | None = None,
+) -> tuple[DocumentRecord | None, str | None]:
+    """Load a single file into a DocumentRecord; returns (doc_or_none, deterministic_doc_id)."""
+    sync_stats = stats if stats is not None else SyncStats()
+    p = Path(path).expanduser()
+    try:
+        real_file = p.resolve(strict=False)
+    except OSError:
+        real_file = p
+
+    excl, _ = is_path_excluded(p, cfg.privacy)
+    if excl:
+        sync_stats.skipped_excluded += 1
+        return None, None
+    if real_file != p:
+        excl_real, _ = is_path_excluded(real_file, cfg.privacy)
+        if excl_real:
+            sync_stats.skipped_excluded += 1
+            return None, None
+
+    if _is_noise_file(real_file):
+        return None, None
+    for part in real_file.parts[:-1]:
+        if part.startswith(".") or part.lower() in _NOISE_DIR_NAMES:
+            return None, None
+
+    ext_map = _active_extension_map(cfg.privacy.enabled_media)
+    spec = ext_map.get(real_file.suffix.lower())
+    if spec is None:
+        return None, None
+
+    prefix = _DOC_PREFIX_BY_MEDIA.get(spec.media_type)
+    doc_id = make_doc_id(prefix, str(real_file)) if prefix else None
+    if not real_file.exists() or not real_file.is_file():
+        return None, doc_id
+
+    if spec.media_type == MediaType.IMAGE and _is_noise_image_path(real_file):
+        return None, doc_id
+
+    repo = RepoPathIndex(atlas).match(real_file, resolve_path=False)
+    ctx = FileContext(
+        cfg=cfg,
+        atlas=atlas,
+        repo=repo,
+        stats=sync_stats,
+        vision_fn=vision_fn,
+        image_cache_lookup=image_cache_lookup,
+        code_count_by_repo=None,
+    )
+    doc = spec.handler(real_file, ctx)
+    if doc is not None:
+        _stamp_file_stat(doc, real_file)
+        return doc, doc.doc_id
+    return None, doc_id
+
+
+def _is_noise_name(name: str) -> bool:
+    if name.startswith("."):
+        return True
+    low = name.lower()
+    if low in _NOISE_FILENAMES:
+        return True
+    if low.endswith(_NOISE_SUFFIXES):
+        return True
+    if ".backup" in low:
+        return True
+    return False
+
+
 def load_file_docs(
     cfg: AppConfig,
     atlas: dict[str, CanonicalRepo],
     vision_fn: Callable[[Path, str], str] | None = None,
     image_cache_lookup: Callable[[str], str | None] | None = None,
     stats: SyncStats | None = None,
+    existing_stats: dict[str, tuple[int | None, int | None, str, str, str]] | None = None,
+    unchanged_doc_ids: set[str] | None = None,
 ) -> list[DocumentRecord]:
-    """Scan cfg.privacy.scan_roots with strict privacy exclusion and extensible media dispatch."""
+    """Scan cfg.privacy.scan_roots with compiled privacy exclusion, stat() fast-path, and media dispatch."""
     sync_stats = stats if stats is not None else SyncStats()
     ext_map = _active_extension_map(cfg.privacy.enabled_media)
     if not ext_map:
         return []
 
+    privacy_matcher = compile_privacy_policy(cfg.privacy)
     docs: list[DocumentRecord] = []
-    seen_real_files: set[Path] = set()
+    seen_real_files: set[str] = set()
     visited_dirs: set[Path] = set()
     deferred_images: list[tuple[int, int, float, Path, CanonicalRepo | None]] = []
     code_counts: dict[str, int] = {}
     repo_index = RepoPathIndex(atlas)
 
-    def _process_candidate_file(
-        file_path: Path,
+    def _process_scandir_file(
+        entry: os.DirEntry[str],
         depth_in_root: int,
         dir_repo: CanonicalRepo | None,
-        is_symlink: bool = False,
+        *,
+        is_symlink: bool,
     ) -> None:
         # Enforce privacy exclusions BEFORE stat() or reading!
-        excl, _ = is_path_excluded(file_path, cfg.privacy)
-        if excl:
-            sync_stats.skipped_excluded += 1
-            return
-
-        if _is_noise_file(file_path):
-            return
-
-        ext = file_path.suffix.lower()
-        spec = ext_map.get(ext)
-        if spec is None:
-            return
-
-        if is_symlink:
+        if not is_symlink:
+            excl, _ = privacy_matcher.check(entry.path, name=entry.name, is_dir=False)
+            if excl:
+                sync_stats.skipped_excluded += 1
+                return
+            if _is_noise_name(entry.name):
+                return
+            ext = os.path.splitext(entry.name)[1].lower()
+            spec = ext_map.get(ext)
+            if spec is None:
+                return
+            real_path_str = entry.path
+            real_file = Path(real_path_str)
+            repo = dir_repo
             try:
-                real_file = file_path.resolve(strict=False)
+                entry_stat = entry.stat(follow_symlinks=True)
+            except OSError:
+                entry_stat = None
+        else:
+            cand = Path(entry.path)
+            excl, _ = privacy_matcher.check(entry.path, raw_path_str=entry.path, name=entry.name, is_dir=False)
+            if excl:
+                sync_stats.skipped_excluded += 1
+                return
+            if _is_noise_name(entry.name):
+                return
+            ext = os.path.splitext(entry.name)[1].lower()
+            spec = ext_map.get(ext)
+            if spec is None:
+                return
+            try:
+                real_file = cand.resolve(strict=False)
             except OSError:
                 return
-            if real_file != file_path:
-                excl_real, _ = is_path_excluded(real_file, cfg.privacy)
+            real_path_str = str(real_file)
+            if real_path_str != entry.path:
+                excl_real, _ = privacy_matcher.check(real_path_str, is_dir=False)
                 if excl_real:
                     sync_stats.skipped_excluded += 1
                     return
             repo = repo_index.match(real_file, resolve_path=False)
-        else:
-            real_file = file_path
-            repo = dir_repo
+            entry_stat = None
 
-        if real_file in seen_real_files:
+        if real_path_str in seen_real_files:
             return
-        seen_real_files.add(real_file)
+        seen_real_files.add(real_path_str)
+
+        if spec.media_type == MediaType.IMAGE and _is_noise_image_path(real_file):
+            return
+
+        unchanged_id = _check_stat_unchanged(
+            real_file=real_file,
+            spec=spec,
+            repo=repo,
+            existing_stats=existing_stats,
+            code_counts=code_counts,
+            cfg=cfg,
+            file_stat=entry_stat,
+        )
+        if unchanged_id is not None:
+            if unchanged_doc_ids is not None:
+                unchanged_doc_ids.add(unchanged_id)
+            sync_stats.stat_skipped += 1
+            return
 
         if spec.media_type == MediaType.IMAGE:
-            if _is_noise_image_path(real_file):
-                return
-            mtime = _file_mtime(real_file) or 0.0
+            if entry_stat is not None:
+                mtime = float(entry_stat.st_mtime)
+            else:
+                mtime = _file_mtime(real_file) or 0.0
             tier_rank = _TIER_PRIORITY[repo.tier] if repo else 0
             deferred_images.append((tier_rank, depth_in_root, -mtime, real_file, repo))
             return
@@ -627,6 +812,7 @@ def load_file_docs(
         )
         doc = spec.handler(real_file, ctx)
         if doc is not None:
+            _stamp_file_stat(doc, real_file)
             docs.append(doc)
 
     for raw_root in cfg.privacy.scan_roots:
@@ -638,7 +824,11 @@ def load_file_docs(
         except OSError:
             continue
 
-        root_excl, _ = is_path_excluded(resolved_root, cfg.privacy)
+        root_excl, _ = privacy_matcher.check(
+            str(resolved_root),
+            raw_path_str=str(root),
+            is_dir=True,
+        )
         if root_excl:
             sync_stats.skipped_excluded += 1
             continue
@@ -653,35 +843,35 @@ def load_file_docs(
 
             home_repo = repo_index.match(resolved_root, resolve_path=False)
             for entry in entries:
-                cand = Path(entry.path)
                 try:
+                    is_sym = entry.is_symlink()
                     if entry.is_dir(follow_symlinks=False):
-                        excl_d, _ = is_path_excluded(cand, cfg.privacy)
+                        excl_d, _ = privacy_matcher.check(entry.path, name=entry.name, is_dir=True)
                         if excl_d:
                             sync_stats.skipped_excluded += 1
                         continue
-                    is_sym = entry.is_symlink()
                     if entry.is_file(follow_symlinks=True):
-                        _process_candidate_file(cand, depth_in_root=0, dir_repo=home_repo, is_symlink=is_sym)
+                        _process_scandir_file(entry, depth_in_root=0, dir_repo=home_repo, is_symlink=is_sym)
                 except OSError:
                     continue
             continue
 
-        stack: list[tuple[Path, int]] = [(resolved_root, 0)]
+        stack: list[tuple[Path, int, bool]] = [(resolved_root, 0, True)]
         while stack:
-            cur_dir, depth = stack.pop()
+            cur_dir, depth, already_checked = stack.pop()
             try:
-                real_dir = cur_dir.resolve(strict=False)
+                real_dir = cur_dir if already_checked else cur_dir.resolve(strict=False)
             except OSError:
                 continue
             if real_dir in visited_dirs:
                 continue
             visited_dirs.add(real_dir)
 
-            excl_dir, _ = is_path_excluded(real_dir, cfg.privacy)
-            if excl_dir:
-                sync_stats.skipped_excluded += 1
-                continue
+            if not already_checked:
+                excl_dir, _ = privacy_matcher.check(str(real_dir), raw_path_str=str(cur_dir), is_dir=True)
+                if excl_dir:
+                    sync_stats.skipped_excluded += 1
+                    continue
 
             dir_repo = repo_index.match(real_dir, resolve_path=False)
             try:
@@ -691,28 +881,27 @@ def load_file_docs(
                 sync_stats.errors.append(f"scandir {real_dir}: {exc}")
                 continue
 
-            subdirs: list[Path] = []
+            subdirs: list[tuple[Path, bool]] = []
             for entry in entries:
-                cand = Path(entry.path)
                 try:
                     is_dir = entry.is_dir(follow_symlinks=False)
                 except OSError:
                     continue
 
                 if is_dir:
-                    excl_sub, _ = is_path_excluded(cand, cfg.privacy)
+                    excl_sub, _ = privacy_matcher.check(entry.path, name=entry.name, is_dir=True)
                     if excl_sub:
                         sync_stats.skipped_excluded += 1
                         continue
                     if entry.name.startswith(".") or entry.name.lower() in _NOISE_DIR_NAMES:
                         continue
-                    subdirs.append(cand)
+                    subdirs.append((Path(entry.path), True))
                 else:
                     try:
                         is_sym = entry.is_symlink()
                         if entry.is_file(follow_symlinks=True):
-                            _process_candidate_file(
-                                cand,
+                            _process_scandir_file(
+                                entry,
                                 depth_in_root=depth,
                                 dir_repo=dir_repo,
                                 is_symlink=is_sym,
@@ -720,8 +909,8 @@ def load_file_docs(
                     except OSError:
                         continue
 
-            for sub in reversed(subdirs):
-                stack.append((sub, depth + 1))
+            for sub, sub_checked in reversed(subdirs):
+                stack.append((sub, depth + 1, sub_checked))
 
     # Process images in priority order (active repos & shallow files first, newest mtime first).
     # Cached lookups are free; new vision_fn captions are capped at max_images_per_sync.
@@ -740,6 +929,7 @@ def load_file_docs(
             img_ctx.repo = img_repo
             doc = img_spec.handler(img_path, img_ctx)
             if doc is not None:
+                _stamp_file_stat(doc, img_path)
                 docs.append(doc)
 
     return docs

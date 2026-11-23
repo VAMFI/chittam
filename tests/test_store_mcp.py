@@ -249,13 +249,13 @@ def test_merkle_zero_recompute_on_second_sync(
     assert embedder.embed_calls == 0
     assert vision.calls == 1  # Still 1 (served from image_cache)
 
-    # Third sync: tier changes on doc_md -> only doc_md re-indexes and re-embeds
+    # Third sync: tier and content change on doc_md -> only doc_md re-indexes and re-embeds
     state["docs"][1] = _make_doc(
         "doc:md1",
         "ARCHITECTURE.md",
-        "Chittam uses SQLite WAL with FTS5 and numpy vectors.",
+        "Chittam uses SQLite WAL with FTS5 and USearch HNSW vectors.",
         media_type=MediaType.MARKDOWN,
-        tier=RepoTier.ARCHIVE,
+        tier=RepoTier.REFERENCE,
     )
     stats3 = indexer.sync_memory(cfg)
     assert stats3.indexed_docs == 1

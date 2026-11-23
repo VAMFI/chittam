@@ -1,8 +1,9 @@
-"""Configuration loading, strict privacy exclusions, and secret redaction for Chittam."""
+"""Configuration loading, compiled privacy exclusions, and secret redaction for Chittam."""
 
 from __future__ import annotations
 
 import fnmatch
+import functools
 import os
 import re
 from pathlib import Path
@@ -14,6 +15,12 @@ from chittam.models import AppConfig, PrivacyPolicy
 
 DEFAULT_POLICY_FILE = Path(__file__).resolve().parents[2] / "config" / "policy.default.yaml"
 USER_CONFIG_FILE = Path("~/.config/chittam/config.yaml").expanduser()
+
+_WILDCARD_CHARS = frozenset("*?[")
+_HARD_BLOCKS: tuple[tuple[str, str], ...] = tuple(
+    (block, block.rstrip("/"))
+    for block in ("/.ssh/", "/.aws/", "/.gnupg/", "/tax/", "/taxes/")
+)
 
 _SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"(gh[pousr]_[A-Za-z0-9_]{16,})"), "[REDACTED_GITHUB_TOKEN]"),
@@ -70,56 +77,167 @@ def save_default_user_config(config: AppConfig | None = None, config_path: Path 
     return target
 
 
-def is_path_excluded(path: Path | str, policy: PrivacyPolicy) -> tuple[bool, str]:
+def _compile_combined_regex(patterns: list[str], flags: int = 0) -> re.Pattern[str] | None:
+    if not patterns:
+        return None
+    parts = [f"(?:{fnmatch.translate(pat)})" for pat in patterns]
+    return re.compile("|".join(parts), flags)
+
+
+class CompiledPrivacyPolicy:
+    """Pre-compiled, zero-allocation privacy policy matcher for fast directory walks."""
+
+    def __init__(self, policy: PrivacyPolicy) -> None:
+        self.excluded_dirs = frozenset(policy.exclude_dir_names)
+        self.file_patterns: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+            (pat, re.compile(fnmatch.translate(pat), re.IGNORECASE))
+            for pat in policy.exclude_file_patterns
+        )
+        self.file_prefilter = _compile_combined_regex(
+            list(policy.exclude_file_patterns),
+            re.IGNORECASE,
+        )
+
+        home_resolved = str(Path.home().resolve())
+        exact_paths: dict[str, str] = {}
+        prefix_list: list[tuple[str, str, str]] = []
+        wildcard_list: list[tuple[re.Pattern[str], str]] = []
+        wildcard_raw_globs: list[str] = []
+
+        def _add_glob_variant(glob_pat: str, raw_glob: str, check_prefix: bool) -> None:
+            if check_prefix and glob_pat.endswith("/**"):
+                prefix = glob_pat[:-3]
+                if not any(ch in prefix for ch in _WILDCARD_CHARS):
+                    prefix_list.append((prefix, prefix + os.sep, raw_glob))
+                    return
+            if not any(ch in glob_pat for ch in _WILDCARD_CHARS):
+                exact_paths.setdefault(glob_pat, raw_glob)
+                return
+            wildcard_list.append((re.compile(fnmatch.translate(glob_pat)), raw_glob))
+            wildcard_raw_globs.append(glob_pat)
+
+        for raw_glob in policy.exclude_path_globs:
+            exp_glob = str(Path(raw_glob).expanduser())
+            is_tilde = raw_glob.startswith("~/")
+            _add_glob_variant(exp_glob, raw_glob, check_prefix=is_tilde or exp_glob.endswith("/**"))
+            if is_tilde:
+                alt_glob = os.path.join(home_resolved, raw_glob[2:])
+                if alt_glob != exp_glob:
+                    _add_glob_variant(alt_glob, raw_glob, check_prefix=True)
+
+        self.exact_paths = exact_paths
+        self.prefix_paths: tuple[tuple[str, str, str], ...] = tuple(prefix_list)
+        self.wildcard_globs: tuple[tuple[re.Pattern[str], str], ...] = tuple(wildcard_list)
+        self.wildcard_prefilter = _compile_combined_regex(wildcard_raw_globs)
+
+    def check(
+        self,
+        path_str: str,
+        *,
+        raw_path_str: str | None = None,
+        name: str | None = None,
+        is_dir: bool = False,
+    ) -> tuple[bool, str]:
+        """Check whether an already-resolved path violates privacy, credential, or noise rules."""
+        # 1. Directory component exclusions
+        if self.excluded_dirs:
+            dir_str = path_str if is_dir else path_str.rpartition(os.sep)[0]
+            if dir_str:
+                for part in dir_str.split(os.sep):
+                    if part in self.excluded_dirs:
+                        return True, f"excluded_dir:{part}"
+
+        # 2. Filename / secret pattern exclusions
+        if self.file_prefilter is not None:
+            fname = name if name is not None else path_str.rpartition(os.sep)[2]
+            if fname and self.file_prefilter.match(fname):
+                for pat, rx in self.file_patterns:
+                    if rx.match(fname):
+                        return True, f"excluded_file_pattern:{pat}"
+
+        # 3. Pre-expanded full path glob exclusions
+        if path_str in self.exact_paths:
+            return True, f"excluded_glob:{self.exact_paths[path_str]}"
+        if raw_path_str and raw_path_str != path_str and raw_path_str in self.exact_paths:
+            return True, f"excluded_glob:{self.exact_paths[raw_path_str]}"
+
+        for prefix, prefix_sep, raw_glob in self.prefix_paths:
+            if path_str == prefix or path_str.startswith(prefix_sep):
+                return True, f"excluded_prefix:{raw_glob}"
+            if raw_path_str and raw_path_str != path_str:
+                if raw_path_str == prefix or raw_path_str.startswith(prefix_sep):
+                    return True, f"excluded_glob:{raw_glob}"
+
+        if self.wildcard_prefilter is not None:
+            matched_resolved = bool(self.wildcard_prefilter.match(path_str))
+            matched_raw = bool(
+                raw_path_str and raw_path_str != path_str and self.wildcard_prefilter.match(raw_path_str)
+            )
+            if matched_resolved or matched_raw:
+                for rx, raw_glob in self.wildcard_globs:
+                    if (matched_resolved and rx.match(path_str)) or (
+                        matched_raw and raw_path_str is not None and rx.match(raw_path_str)
+                    ):
+                        return True, f"excluded_glob:{raw_glob}"
+
+        # 4. Hard-coded safety guardrails even if user edits config
+        lowered = path_str.lower()
+        for block, stripped in _HARD_BLOCKS:
+            if block in lowered or lowered.endswith(stripped):
+                return True, f"hard_privacy_guard:{block}"
+
+        return False, ""
+
+
+@functools.lru_cache(maxsize=64)
+def _get_cached_privacy_policy(
+    exclude_dirs: tuple[str, ...],
+    exclude_files: tuple[str, ...],
+    exclude_globs: tuple[str, ...],
+    home_env: str,
+) -> CompiledPrivacyPolicy:
+    policy = PrivacyPolicy(
+        exclude_dir_names=list(exclude_dirs),
+        exclude_file_patterns=list(exclude_files),
+        exclude_path_globs=list(exclude_globs),
+    )
+    return CompiledPrivacyPolicy(policy)
+
+
+def compile_privacy_policy(policy: PrivacyPolicy) -> CompiledPrivacyPolicy:
+    """Return a cached CompiledPrivacyPolicy keyed by exact rule tuples and $HOME."""
+    return _get_cached_privacy_policy(
+        tuple(policy.exclude_dir_names),
+        tuple(policy.exclude_file_patterns),
+        tuple(policy.exclude_path_globs),
+        os.environ.get("HOME", ""),
+    )
+
+
+def is_path_excluded(
+    path: Path | str,
+    policy: PrivacyPolicy,
+    *,
+    already_resolved: bool = False,
+    is_dir: bool | None = None,
+) -> tuple[bool, str]:
     """Return (True, reason) if path violates privacy, credential, or noise rules."""
-    p = Path(path).expanduser()
-    try:
-        resolved = p.resolve(strict=False)
-    except OSError:
-        resolved = p
+    matcher = compile_privacy_policy(policy)
+    if already_resolved:
+        path_str = os.fspath(path)
+        raw_str = path_str
+        resolved_is_dir = bool(is_dir)
+    else:
+        p = Path(path).expanduser()
+        raw_str = str(p)
+        try:
+            resolved = p.resolve(strict=False)
+        except OSError:
+            resolved = p
+        path_str = str(resolved)
+        resolved_is_dir = resolved.is_dir() if is_dir is None else bool(is_dir)
 
-    path_str = str(resolved)
-    home = str(Path.home().resolve())
-    parts = resolved.parts
-
-    # 1. Directory component exclusions
-    excluded_dirs = set(policy.exclude_dir_names)
-    for part in parts[:-1] if not resolved.is_dir() else parts:
-        if part in excluded_dirs:
-            return True, f"excluded_dir:{part}"
-
-    # 2. Filename / secret pattern exclusions
-    name = resolved.name
-    for pat in policy.exclude_file_patterns:
-        if fnmatch.fnmatch(name, pat) or fnmatch.fnmatch(name.lower(), pat.lower()):
-            return True, f"excluded_file_pattern:{pat}"
-
-    # 3. Full path glob exclusions (normalized relative to ~ as well as absolute)
-    for raw_glob in policy.exclude_path_globs:
-        exp_glob = str(Path(raw_glob).expanduser())
-        # Normalize without resolving symlink if non-existent, and with resolve
-        if fnmatch.fnmatch(path_str, exp_glob) or fnmatch.fnmatch(str(p), exp_glob):
-            return True, f"excluded_glob:{raw_glob}"
-        # Handle ~ vs /Users/<user> consistently
-        if raw_glob.startswith("~/"):
-            alt_glob = os.path.join(home, raw_glob[2:])
-            if fnmatch.fnmatch(path_str, alt_glob) or fnmatch.fnmatch(str(p), alt_glob):
-                return True, f"excluded_glob:{raw_glob}"
-            if alt_glob.endswith("/**"):
-                prefix = alt_glob[:-3]
-                if path_str == prefix or path_str.startswith(prefix + os.sep):
-                    return True, f"excluded_prefix:{raw_glob}"
-            if path_str == alt_glob:
-                return True, f"excluded_exact:{raw_glob}"
-
-    # 4. Extra hard-coded safety guardrails for sensitive paths even if user edits config
-    lowered = path_str.lower()
-    hard_blocks = ("/.ssh/", "/.aws/", "/.gnupg/", "/tax/", "/taxes/")
-    for block in hard_blocks:
-        if block in lowered or lowered.endswith(block.rstrip("/")):
-            return True, f"hard_privacy_guard:{block}"
-
-    return False, ""
+    return matcher.check(path_str, raw_path_str=raw_str, is_dir=resolved_is_dir)
 
 
 def redact_secrets(text: str) -> str:

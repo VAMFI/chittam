@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "chittam"
-version = "0.1.0"
+version = "0.2.0"
 description = "Chittam — Local-first multimodal semantic memory, temporal decision graph, and canonical project atlas MCP unifying Antigravity, Codex, and Claude Code."
 readme = "README.md"
 license = { text = "MIT" }
@@ -19,7 +19,12 @@ dependencies = [
     "pillow>=10.0",
     "typer>=0.12",
     "pytest>=8.0",
+    "usearch>=2.15",
+    "watchfiles>=1.0",
 ]
+
+[project.optional-dependencies]
+rerank = ["flashrank>=0.2.10"]
 
 [project.scripts]
 chittam = "chittam.cli:app"

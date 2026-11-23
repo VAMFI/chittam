@@ -27,21 +27,21 @@ If you use more than one AI coding agent, you have probably hit these:
 
 ## What Chittam does
 
-1. **Scans** the folders you choose, plus your Antigravity, Codex, and Claude Code histories.
+1. **Scans** the folders you choose (with a fast `stat()` pre-filter and real-time `chittam watch`), plus your Antigravity, Codex, and Claude Code histories.
 2. **Blocks** secrets and private folders *before* reading them (`.env`, keys, tax folders, credential files).
-3. **Understands** text, code, PDFs, and images, using local models through [Ollama](https://ollama.com).
-4. **Ranks** active projects above old copies by tracking every git repo as `active`, `reference`, or `archive`.
-5. **Serves** compact search results over MCP, only when an agent asks, so prompt caches stay intact.
+3. **Understands** text, code, PDFs, images, and decisions using local models through [Ollama](https://ollama.com).
+4. **Indexes cleanly at scale** using **USearch HNSW** with Matryoshka **256-d `i8` quantization** (~12x smaller than 768-d `float32`), **content-hash deduplication** across cloned repos, and **tiered embedding** (`active`/`reference` vectorized; `archive` stays fast BM25-only by default).
+5. **Ranks** active projects above old copies, supports optional local ONNX cross-encoder reranking (`chittam[rerank]`), and serves compact results over pull-only MCP so prompt caches stay intact.
 
 ```mermaid
 flowchart TD
     A["Your folders: repos, notes, PDFs, images"] --> G
     B["Agent histories: Antigravity, Codex, Claude Code"] --> G
-    G{"Privacy gate: skip secrets and private folders"} --> P
-    P["Parse and chunk: code, markdown, PDF, image captions"] --> M
-    M["Local models via Ollama: text embeddings + vision captions"] --> S
-    S[("SQLite index: keyword + vector + project atlas + decisions")] --> Q
-    Q["Hybrid search: keyword + meaning, active projects first"] --> MCP
+    G{"Compiled privacy gate: skip secrets and private folders"} --> P
+    P["stat() pre-filter + parse & chunk: code, markdown, PDF, image captions"] --> M
+    M["Local models via Ollama: Matryoshka 256-d i8 embeddings + vision"] --> S
+    S[("SQLite WAL (FTS5 + content-deduped blobs + atlas + decisions) + vectors.usearch")] --> Q
+    Q["Hybrid search: BM25 + USearch RRF + tier/recency + optional FlashRank rerank"] --> MCP
     MCP["Pull-only MCP server: chittam-mcp"] --> H1["Antigravity"]
     MCP --> H2["Codex"]
     MCP --> H3["Claude Code"]
@@ -57,11 +57,12 @@ Chittam doesn't rebuild what already works well. It connects existing tools and 
 | :--- | :--- | :--- |
 | [`ripgrep`](https://github.com/BurntSushi/ripgrep) | Exact matches in the current repo | Agents keep using it for known symbols |
 | [CodeGraph](https://github.com/colbymchenry/codegraph) | Call graphs and symbol relationships | Installed alongside Chittam as a second MCP server |
-| [LEANN](https://github.com/StarTrail-org/LEANN) | Very small vector indexes | Optional export target (`chittam sync --leann-export`) |
+| [USearch](https://github.com/unum-cloud/usearch) | Fast, single-file `i8` HNSW ANN index | Built-in default vector index (`vectors.usearch`), rebuildable offline from SQLite |
+| [LEANN](https://github.com/StarTrail-org/LEANN) | Ultra-compact graph-recomputed indexes | Optional export target (`chittam sync --leann-export`) |
 | [qmd](https://github.com/tobi/qmd) | Hybrid search over markdown notes | Same hybrid idea, extended to code, images, and agent threads |
 | [claude-mem](https://github.com/thedotmack/claude-mem) | Automatic session memory | Chittam is pull-only, so it never rewrites your prompt |
 
-What Chittam adds: **cross-agent recall**, **active-vs-archived project ranking**, **image and PDF understanding**, **decision history**, and a **strict privacy gate**, in one local index.
+What Chittam adds: **cross-agent recall**, **active-vs-archived project ranking**, **image and PDF understanding**, **semantic decision history**, **deduped quantized ANN search**, and a **strict privacy gate** in one local stack.
 
 ---
 
@@ -70,13 +71,14 @@ What Chittam adds: **cross-agent recall**, **active-vs-archived project ranking*
 **Requirements:** macOS or Linux, Python 3.11+, [uv](https://docs.astral.sh/uv/), [Ollama](https://ollama.com). Any Apple Silicon Mac or a machine with about 8 GB of free RAM works.
 
 ```bash
-# 1. Install
+# 1. Install (add `--extra rerank` for optional local ONNX cross-encoder reranking)
 git clone https://github.com/VAMFI/chittam.git
 cd chittam
 uv sync
+# optional: uv sync --extra rerank
 
 # 2. Pull the local models (about 2.5 GB total)
-ollama pull embeddinggemma:latest   # text embeddings
+ollama pull embeddinggemma:latest   # text embeddings (Matryoshka 256-d i8 by default)
 ollama pull qwen3-vl:2b             # image understanding
 
 # 3. Check everything works, without touching your files
@@ -86,18 +88,17 @@ uv run chittam benchmark --synthetic
 uv run chittam init
 #    -> ~/.config/chittam/config.yaml   (see docs/HOW_TO.md#2)
 
-# 5. Build the index
+# 5. Build the index & verify health
 uv run chittam sync
-
-# 6. Try a search
-uv run chittam search "where do we handle login retries"
+uv run chittam doctor
 ```
 
-**Connect your agents** (backs up every config file first):
+**Connect your agents and keep the index fresh** (backs up every config file first):
 
 ```bash
 uv run chittam install-harnesses   # Antigravity + Codex + Claude Code
-uv run chittam install-launchd     # macOS: re-sync every 30 minutes
+uv run chittam watch               # real-time FSEvents/inotify incremental sync
+uv run chittam install-launchd     # macOS: periodic safety-net sync every 30 minutes
 ```
 
 Undo at any time with `uv run chittam uninstall-harnesses` and `uv run chittam uninstall-launchd`.
@@ -117,26 +118,30 @@ uv tool install leann-core --with leann       # compact vector index export
 | :--- | :--- |
 | `chittam init` | Create config, database, and project atlas |
 | `chittam atlas [--refresh]` | List discovered git repos and their tier |
-| `chittam sync` | Incremental index update (only changed files are re-processed) |
-| `chittam search "query"` | Hybrid search (`--media-type image`, `--project`, `--harness`, `--no-archived`, `--json`) |
-| `chittam decide <project> <topic> "<statement>"` | Record a decision (replaces the previous one on that topic) |
-| `chittam decisions` | List current decisions |
-| `chittam status` | Index size, counts, background sync status |
+| `chittam sync` | Incremental `stat()` + Merkle sync and deduped vector embeddings |
+| `chittam watch` | Watch configured folders and harness histories in real time |
+| `chittam search "query"` | Hybrid search (`--rerank/--no-rerank`, `--media-type`, `--project`, `--harness`, `--no-archived`, `--json`) |
+| `chittam decide <project> <topic> "<statement>"` | Record a decision (supersedes prior active decision on that topic; semantically indexed) |
+| `chittam decisions` | List current decisions (`--all` for history) |
+| `chittam status` | Index size, counts, USearch vector state, and background sync status |
+| `chittam doctor` | Non-destructive diagnostics across config, SQLite/USearch parity, Ollama, TCC, and harnesses |
+| `chittam compact` | Prune orphan vector blobs, compact USearch, checkpoint WAL, and `VACUUM` SQLite |
+| `chittam reindex-vectors` | Rebuild `vectors.usearch` completely offline from SQLite |
 | `chittam install-harnesses` / `uninstall-harnesses` | Wire or unwire MCP in all three agents |
 | `chittam install-launchd` / `uninstall-launchd` | Enable or disable scheduled sync (macOS) |
-| `chittam benchmark [--synthetic] [--cases FILE]` | Measure retrieval quality and privacy leakage |
+| `chittam benchmark [--synthetic] [--rerank]` | Measure retrieval quality, latency, and privacy leakage |
 | `chittam mcp` | Run the MCP server on stdio |
 
 ## MCP tools
 
 | Tool | Use it when an agent needs to... |
 | :--- | :--- |
-| `memory_search` | Find something by meaning across code, docs, PDFs, images, and threads |
+| `memory_search` | Find something by meaning across code, docs, PDFs, images, threads, and decisions |
 | `memory_get_chunk` | Read the full text around a search hit |
 | `project_atlas` | Know which copy of a project is the current one |
 | `recall_threads` | Recall what was discussed in earlier Antigravity, Codex, or Claude Code sessions |
 | `record_decision` | Save an architectural decision so future sessions respect it |
-| `index_status` | Check that the index exists and is fresh |
+| `index_status` | Check that the index and USearch vector store exist and are fresh |
 
 Agents are told *when* to use these through a short rule: [docs/ROUTING_RULE.md](docs/ROUTING_RULE.md).
 
@@ -144,13 +149,25 @@ Agents are told *when* to use these through a short rule: [docs/ROUTING_RULE.md]
 
 Reproducible on any machine with `uv run chittam benchmark --synthetic` (14 fixture documents plus 3 private files that must be blocked):
 
-| Metric | Result |
+| Metric | Result (v0.2.0 USearch 256-d `i8`) |
 | :--- | :--- |
 | Recall@5 | **1.0** (13/13 queries) |
-| MRR | **0.95** |
+| MRR | **0.9385** |
+| Query latency | **p50 0.42 ms / p95 0.84 ms** |
 | Privacy leakage | **0** (3/3 private fixtures blocked at ingest) |
 
-On a real developer machine (M4 Pro, 24 GB) with about 31,000 documents and 330,000 chunks, a personal 15-query set scored Recall@5 1.0 and MRR 0.94, with p50 latency around 380 ms. See [the FAQ](docs/FAQ.md#how-fast-is-it) for honest caveats.
+On a real developer machine (Apple M4 Pro, 24 GB) with ~31,100 documents and ~333,000 chunks, upgrading from v0.1 to v0.2 improved accuracy, speed, and footprint:
+
+| Real-corpus metric | v0.1 (`768-d f32`, numpy) | v0.2 (`256-d i8`, USearch) | v0.2 + `--rerank` (`MiniLM-L-12`) |
+| :--- | :--- | :--- | :--- |
+| Recall@5 | 1.0 | **1.0** | **1.0** |
+| MRR | 0.9423 | **1.0** | 0.9487 |
+| Query latency (incl. Ollama query embed) | p50 436 ms / p95 3,136 ms | **p50 294 ms / p95 1,704 ms** | p50 505 ms / p95 1,501 ms |
+| Privacy leakage | 0 | **0** | **0** |
+| File scan over ~30.8k unchanged files | 29.3 s (Merkle read) | **2.5 s** (`stat()` + compiled policy) | — |
+| Vector store size (~12.3k active/ref vectors) | ~36 MB raw f32 blobs | **4.77 MiB** (`vectors.usearch`, 10.4k unique hashes) | — |
+
+See [the FAQ](docs/FAQ.md#how-fast-is-it) for details.
 
 ## Documentation
 

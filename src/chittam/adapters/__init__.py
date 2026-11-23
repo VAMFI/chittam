@@ -442,7 +442,7 @@ def chunk_code(
 from chittam.adapters.antigravity import load_antigravity_docs  # noqa: E402
 from chittam.adapters.claude_code import load_claude_code_docs  # noqa: E402
 from chittam.adapters.codex import load_codex_docs  # noqa: E402
-from chittam.adapters.files import MEDIA_HANDLERS, load_file_docs  # noqa: E402
+from chittam.adapters.files import MEDIA_HANDLERS, load_file_docs, load_single_file_doc  # noqa: E402
 
 
 def collect_all_documents(
@@ -450,6 +450,8 @@ def collect_all_documents(
     atlas: dict[str, CanonicalRepo],
     vision_fn: Callable[[Path, str], str] | None = None,
     image_cache_lookup: Callable[[str], str | None] | None = None,
+    existing_stats: dict[str, tuple[int | None, int | None, str, str, str]] | None = None,
+    unchanged_doc_ids: set[str] | None = None,
 ) -> tuple[list[DocumentRecord], SyncStats]:
     """Collect normalized DocumentRecords across all harness and filesystem adapters."""
     stats = SyncStats()
@@ -477,6 +479,8 @@ def collect_all_documents(
             vision_fn=vision_fn,
             image_cache_lookup=image_cache_lookup,
             stats=stats,
+            existing_stats=existing_stats,
+            unchanged_doc_ids=unchanged_doc_ids,
         ),
     )
 
@@ -500,6 +504,7 @@ __all__ = [
     "load_claude_code_docs",
     "load_codex_docs",
     "load_file_docs",
+    "load_single_file_doc",
     "make_chunk_id",
     "make_doc_id",
     "make_l0_summary",

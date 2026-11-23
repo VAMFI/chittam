@@ -12,8 +12,14 @@ import typer
 from chittam.atlas import build_or_load_atlas, save_atlas
 from chittam.config import load_config, save_default_user_config
 from chittam.indexer import build_leann_export, sync_memory
-from chittam.models import AppConfig, RepoTier
-from chittam.providers import build_embedding_provider
+from chittam.models import AppConfig, RepoTier, SyncStats
+from chittam.providers import (
+    DEFAULT_RERANK_MODEL,
+    FlashRankRerankProvider,
+    RerankProvider,
+    build_query_embedding_provider,
+    build_rerank_provider,
+)
 from chittam.store import ChittamStore
 
 app = typer.Typer(
@@ -123,8 +129,8 @@ def sync_cmd(
         typer.echo(
             f"Sync complete in {stats.duration_ms:.1f}ms | "
             f"scanned={stats.scanned_docs} indexed={stats.indexed_docs} "
-            f"unchanged={stats.skipped_unchanged} excluded={stats.skipped_excluded} "
-            f"chunks={stats.chunks_written} embeddings={stats.embeddings_computed} "
+            f"unchanged={stats.skipped_unchanged} (stat={stats.stat_skipped}) excluded={stats.skipped_excluded} "
+            f"chunks={stats.chunks_written} embeddings={stats.embeddings_computed} deduped={stats.embeddings_deduped} "
             f"images_captioned={stats.images_captioned} images_cached={stats.images_cached}"
         )
         if stats.errors:
@@ -142,16 +148,31 @@ def search_cmd(
     harness: str | None = typer.Option(None, "--harness", help="Filter by source_harness."),
     include_archived: bool = typer.Option(True, "--include-archived/--no-archived", help="Include archived repos."),
     no_vector: bool = typer.Option(False, "--no-vector", help="Use FTS5 BM25 only without embedding query."),
+    rerank: bool | None = typer.Option(None, "--rerank/--no-rerank", help="Override local cross-encoder reranking."),
     json_out: bool = typer.Option(False, "--json", help="Emit JSON output."),
     config: Path | None = typer.Option(None, "--config", "-c", help="Override config YAML path."),
 ) -> None:
-    """Run hybrid BM25 + vector search against the local Chittam store."""
+    """Run hybrid BM25 + USearch vector search against the local Chittam store."""
     cfg = _load_cfg(config)
-    with ChittamStore(cfg.db_path) as store:
+    reranker: RerankProvider | None = None
+    if rerank is not False:
+        reranker = build_rerank_provider(cfg)
+        if reranker is None and rerank is True:
+            try:
+                import flashrank  # noqa: F401
+
+                reranker = FlashRankRerankProvider(
+                    model_name=DEFAULT_RERANK_MODEL,
+                    cache_dir=Path(cfg.data_dir).expanduser() / "models" / "flashrank",
+                )
+            except ImportError:
+                typer.echo("flashrank is not installed; install with `uv sync --extra rerank`.", err=True)
+
+    with ChittamStore(cfg) as store:
         q_vec: np.ndarray | None = None
         if not no_vector and store.has_embeddings():
             try:
-                provider = build_embedding_provider(cfg, use_external=False)
+                provider = build_query_embedding_provider(cfg, index_meta=store.get_index_meta())
                 q_vec = np.asarray(provider.embed_query(query), dtype=np.float32)
             except Exception:
                 q_vec = None
@@ -164,6 +185,8 @@ def search_cmd(
             project_id=project_id,
             source_harness=harness,
             include_archived=include_archived,
+            reranker=reranker,
+            rerank_top_k=cfg.local_provider.rerank_top_k,
         )
 
     if json_out:
@@ -235,9 +258,9 @@ def status_cmd(
     json_out: bool = typer.Option(False, "--json", help="Emit JSON output."),
     config: Path | None = typer.Option(None, "--config", "-c", help="Override config YAML path."),
 ) -> None:
-    """Show index stats, atlas status, and launchd background sync status."""
+    """Show index stats, USearch vector index state, atlas status, and launchd status."""
     cfg = _load_cfg(config)
-    with ChittamStore(cfg.db_path) as store:
+    with ChittamStore(cfg) as store:
         stats = store.get_stats()
 
     atlas_count = 0
@@ -254,6 +277,7 @@ def status_cmd(
 
     payload = {
         "db_exists": cfg.db_path.exists(),
+        "vector_index_exists": cfg.vector_index_path.exists(),
         "atlas_exists": cfg.atlas_path.exists(),
         "atlas_projects": atlas_count,
         "stats": stats,
@@ -263,13 +287,108 @@ def status_cmd(
         typer.echo(json.dumps(payload, indent=2))
         return
 
-    typer.echo(f"DB: {stats['db_path']} ({stats['db_size_bytes']} bytes)")
+    typer.echo(
+        f"DB: {stats['db_path']} ({stats['db_size_bytes']} bytes) | "
+        f"Vectors ({stats['vector_backend']}, dim={stats['vector_dim']}, dtype={stats['vector_dtype']}): "
+        f"{stats['vector_index_path']} ({stats['vector_index_bytes']} bytes)"
+    )
     typer.echo(
         f"Docs={stats['documents']} Chunks={stats['chunks']} Embeddings={stats['embeddings']} "
-        f"Decisions={stats['active_decisions']}/{stats['decisions']} CachedImages={stats['cached_images']}"
+        f"(unique={stats['unique_embeddings']}) Decisions={stats['active_decisions']}/{stats['decisions']} "
+        f"CachedImages={stats['cached_images']}"
     )
     typer.echo(f"Atlas: {cfg.atlas_path} ({atlas_count} repos)")
     typer.echo(f"Launchd: {json.dumps(launchd_info)}")
+
+
+@app.command("watch")
+def watch_cmd(
+    debounce_ms: int = typer.Option(1500, "--debounce-ms", help="Debounce interval in milliseconds."),
+    no_vision: bool = typer.Option(False, "--no-vision", help="Skip vision captioning during watch."),
+    no_embeddings: bool = typer.Option(False, "--no-embeddings", help="Skip embedding computation during watch."),
+    config: Path | None = typer.Option(None, "--config", "-c", help="Override config YAML path."),
+) -> None:
+    """Watch scan roots and harness directories and incrementally sync changed files."""
+    from chittam.watcher import build_watch_roots, run_watcher
+
+    cfg = _load_cfg(config)
+    roots = build_watch_roots(cfg)
+    typer.echo(f"Watching {len(roots)} roots (debounce={debounce_ms}ms)...")
+
+    def _on_batch(batch: SyncStats) -> None:
+        typer.echo(
+            f"[watch] {batch.duration_ms:.1f}ms indexed={batch.indexed_docs} "
+            f"chunks={batch.chunks_written} embeddings={batch.embeddings_computed}"
+        )
+
+    try:
+        run_watcher(
+            cfg,
+            debounce_ms=debounce_ms,
+            skip_embeddings=no_embeddings,
+            skip_vision=no_vision,
+            on_batch=_on_batch,
+        )
+    except KeyboardInterrupt:
+        typer.echo("Watcher stopped.")
+
+
+@app.command("doctor")
+def doctor_cmd(
+    json_out: bool = typer.Option(False, "--json", help="Emit JSON diagnostics."),
+    config: Path | None = typer.Option(None, "--config", "-c", help="Override config YAML path."),
+) -> None:
+    """Run non-destructive health diagnostics across database, vectors, Ollama, TCC, and harnesses."""
+    from chittam.doctor import run_doctor
+
+    cfg = _load_cfg(config)
+    report = run_doctor(cfg)
+    if json_out:
+        typer.echo(json.dumps(report, indent=2))
+        return
+
+    for chk in report["checks"]:
+        badge = chk["status"].upper()
+        typer.echo(f"[{badge:4s}] {chk['name']}: {chk['detail']}")
+        if chk.get("hint"):
+            typer.echo(f"       hint: {chk['hint']}")
+
+
+@app.command("compact")
+def compact_cmd(
+    json_out: bool = typer.Option(False, "--json", help="Emit JSON output."),
+    config: Path | None = typer.Option(None, "--config", "-c", help="Override config YAML path."),
+) -> None:
+    """Prune orphaned vector blobs, compact USearch, checkpoint WAL, and VACUUM SQLite."""
+    cfg = _load_cfg(config)
+    with ChittamStore(cfg) as store:
+        report = store.compact()
+    if json_out:
+        typer.echo(json.dumps(report, indent=2))
+        return
+    typer.echo(
+        f"Compacted: orphans_deleted={report['orphans_deleted']} vectors_rebuilt={report['rebuilt_vectors']} | "
+        f"DB {report['db_size_before']} -> {report['db_size_after']} bytes | "
+        f"USearch {report['vector_index_bytes_before']} -> {report['vector_index_bytes_after']} bytes"
+    )
+
+
+@app.command("reindex-vectors")
+def reindex_vectors_cmd(
+    json_out: bool = typer.Option(False, "--json", help="Emit JSON output."),
+    config: Path | None = typer.Option(None, "--config", "-c", help="Override config YAML path."),
+) -> None:
+    """Rebuild vectors.usearch completely offline from SQLite content_embeddings."""
+    cfg = _load_cfg(config)
+    with ChittamStore(cfg) as store:
+        report = store.rebuild_vector_index()
+    if json_out:
+        typer.echo(json.dumps(report, indent=2))
+        return
+    typer.echo(
+        f"Rebuilt {report['rebuilt']} vectors ({report['vector_backend']}, "
+        f"dim={report['dim']}, dtype={report['dtype']}, {report['vector_index_bytes']} bytes)"
+    )
 
 
 @app.command("install-harnesses")
@@ -331,6 +450,7 @@ def benchmark_cmd(
     cases: Path | None = typer.Option(
         None, "--cases", help="YAML file of custom cases (default: ~/.config/chittam/benchmark_cases.yaml)."
     ),
+    rerank: bool | None = typer.Option(None, "--rerank/--no-rerank", help="Override local cross-encoder reranking during benchmark."),
     config: Path | None = typer.Option(None, "--config", "-c", help="Override config YAML path."),
 ) -> None:
     """Run the retrieval-quality and privacy-leakage benchmark."""
@@ -341,7 +461,7 @@ def benchmark_cmd(
     else:
         cfg = _load_cfg(config)
         custom = load_cases_from_yaml(cases) if cases else None
-        report = run_benchmark(cfg, cases=custom)
+        report = run_benchmark(cfg, use_rerank=rerank, cases=custom)
     typer.echo(json.dumps(report, indent=2))
 
 
