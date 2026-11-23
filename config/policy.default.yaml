@@ -1,0 +1,117 @@
+data_dir: ~/.local/share/chittam
+config_dir: ~/.config/chittam
+
+privacy:
+  scan_roots:
+    - ~/Projects
+    - ~/Code
+    - ~/Documents
+    - "~"
+  home_top_level_files_only: true
+  enabled_media:
+    - code
+    - markdown
+    - text
+    - pdf
+    - image
+    - transcript
+    - decision
+  exclude_path_globs:
+    - ~/tax
+    - ~/tax/**
+    - ~/taxes
+    - ~/taxes/**
+    - ~/Library/**
+    - ~/.Trash/**
+    - ~/.ssh/**
+    - ~/.aws/**
+    - ~/.gnupg/**
+    - ~/.kube/**
+    - ~/.gemini/oauth_creds.json
+    - ~/.gemini/mcp-oauth-tokens*.json
+    - ~/.gemini/google_accounts.json
+    - ~/.claude/.credentials.json
+    - ~/.codex/auth.json
+    - ~/.codex/auth.lock
+    - ~/.codex/auth.json.lock
+  exclude_dir_names:
+    - .git
+    - node_modules
+    - .venv
+    - venv
+    - __pycache__
+    - .pytest_cache
+    - .mypy_cache
+    - .ruff_cache
+    - .dart_tool
+    - .gradle
+    - build
+    - dist
+    - target
+    - .next
+    - .nuxt
+    - Pods
+    - DerivedData
+    - .cache
+    - tax
+    - taxes
+  exclude_file_patterns:
+    - .env
+    - .env.*
+    - "*.env"
+    - "*.pem"
+    - "*.key"
+    - "*.p12"
+    - "*.pfx"
+    - "*.kdbx"
+    - id_rsa*
+    - id_ed25519*
+    - "*credentials*"
+    - "*secret*"
+    - auth.json
+    - oauth_creds.json
+    - mcp-oauth-tokens*
+    - "*.keystore"
+    - "*.jks"
+    - GoogleService-Info.plist
+    - google-services.json
+  max_text_file_bytes: 512000
+  max_pdf_bytes: 25000000
+  max_pdf_pages: 40
+  min_image_bytes: 10240
+  max_image_bytes: 20000000
+  max_images_per_sync: 15
+  max_code_files_per_repo: 250
+  max_embed_chunks_per_sync: 6000
+
+local_provider:
+  ollama_base_url: http://127.0.0.1:11434
+  embedding_model: embeddinggemma:latest
+  embedding_dim: 768
+  matryoshka_dim: null
+  vision_model: qwen3-vl:2b
+  rerank_model: null
+  timeout_seconds: 90.0
+
+external_provider:
+  enabled: false
+  user_consented: false
+  provider_type: openai_compatible
+  base_url: ""
+  api_key_env: ""
+  embedding_model: ""
+  vision_model: ""
+  rerank_model: ""
+
+harnesses:
+  antigravity_mcp_path: ~/.gemini/config/mcp_config.json
+  codex_config_path: ~/.codex/config.toml
+  claude_config_path: ~/.claude.json
+  antigravity_brain_dir: ~/.gemini/antigravity/brain
+  codex_home_dir: ~/.codex
+  codex_legacy_memories_dirs: []
+  claude_projects_dir: ~/.claude/projects
+  claude_history_path: ~/.claude/history.jsonl
+
+enable_leann_bridge: true
+enable_codegraph: true

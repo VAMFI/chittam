@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Install
+        run: uv sync --python 3.12
+      - name: Configure git identity for fixture repos
+        run: |
+          git config --global user.email "ci@example.com"
+          git config --global user.name "CI"
+      - name: Tests
+        run: uv run pytest -q
+      - name: Synthetic benchmark (quality + privacy gate)
+        run: |
+          uv run chittam benchmark --synthetic > bench.json
+          python3 -c "import json; r=json.load(open('bench.json')); print({k: r[k] for k in ['Recall@5','MRR','privacy_leakage']}); assert r['privacy_leakage']==0 and r['Recall@5']==1.0"
