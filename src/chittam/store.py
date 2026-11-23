@@ -154,12 +154,33 @@ class ChittamStore:
             self.conn.close()
 
     def _init_db(self) -> None:
+        required_tables = {
+            "documents",
+            "chunks",
+            "chunks_fts",
+            "chunk_embeddings",
+            "image_cache",
+            "decisions",
+        }
         with self._lock:
-            self.conn.execute("PRAGMA journal_mode=WAL;")
-            self.conn.execute("PRAGMA synchronous=NORMAL;")
+            self.conn.execute("PRAGMA busy_timeout=30000;")
             self.conn.execute("PRAGMA foreign_keys=ON;")
-            self.conn.execute("PRAGMA busy_timeout=5000;")
             self.conn.execute("PRAGMA temp_store=MEMORY;")
+            self.conn.execute("PRAGMA synchronous=NORMAL;")
+
+            jm_row = self.conn.execute("PRAGMA journal_mode;").fetchone()
+            current_jm = str(jm_row[0]).lower() if jm_row else ""
+            if current_jm != "wal":
+                self.conn.execute("PRAGMA journal_mode=WAL;")
+
+            existing_tables = {
+                row[0]
+                for row in self.conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            if required_tables.issubset(existing_tables):
+                return
 
             self.conn.executescript(
                 """
@@ -274,12 +295,20 @@ class ChittamStore:
         doc_meta = json.dumps(doc.metadata, ensure_ascii=False)
 
         with self._lock, self.conn:
-            self.conn.execute("DELETE FROM chunks_fts WHERE doc_id = ?", (doc.doc_id,))
-            self.conn.execute(
-                "DELETE FROM chunk_embeddings WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE doc_id = ?)",
-                (doc.doc_id,),
+            exists = (
+                self.conn.execute(
+                    "SELECT 1 FROM documents WHERE doc_id = ? LIMIT 1",
+                    (doc.doc_id,),
+                ).fetchone()
+                is not None
             )
-            self.conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc.doc_id,))
+            if exists:
+                self.conn.execute("DELETE FROM chunks_fts WHERE doc_id = ?", (doc.doc_id,))
+                self.conn.execute(
+                    "DELETE FROM chunk_embeddings WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE doc_id = ?)",
+                    (doc.doc_id,),
+                )
+                self.conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc.doc_id,))
 
             self.conn.execute(
                 """

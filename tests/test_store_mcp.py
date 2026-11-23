@@ -603,3 +603,31 @@ def test_chunk_shrink_cleanup_decision_search_and_leann_export(
         assert len(lines) == 1
         assert json.loads(lines[0])["id"] == "doc:shrink:chunk:0"
 
+
+def test_store_busy_timeout_wal_reopen_and_upsert_replace(tmp_path: Path) -> None:
+    db_path = tmp_path / "lock_check.db"
+    with ChittamStore(db_path) as store1:
+        busy_ms = int(store1.conn.execute("PRAGMA busy_timeout;").fetchone()[0])
+        jm = str(store1.conn.execute("PRAGMA journal_mode;").fetchone()[0]).lower()
+        assert busy_ms == 30000
+        assert jm == "wal"
+
+        doc_v1 = _make_doc("doc:reopen", "alpha.py", "alpha_token_v1 old_body")
+        store1.upsert_document(doc_v1)
+
+    with ChittamStore(db_path) as store2:
+        busy_ms2 = int(store2.conn.execute("PRAGMA busy_timeout;").fetchone()[0])
+        jm2 = str(store2.conn.execute("PRAGMA journal_mode;").fetchone()[0]).lower()
+        assert busy_ms2 == 30000
+        assert jm2 == "wal"
+
+        doc_v2 = _make_doc("doc:reopen", "alpha.py", "beta_token_v2 replacement_body")
+        store2.upsert_document(doc_v2)
+
+        assert store2.search("alpha_token_v1") == []
+        hits = store2.search("beta_token_v2")
+        assert len(hits) == 1
+        assert hits[0].doc_id == "doc:reopen"
+        assert store2.get_stats()["chunks"] == 1
+
+
