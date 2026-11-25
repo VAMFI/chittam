@@ -93,15 +93,16 @@ uv run chittam sync
 uv run chittam doctor
 ```
 
-**Connect your agents and keep the index fresh** (backs up every config file first):
+**Connect your agents, activate routing rules, and keep the index fresh** (backs up every config file first):
 
 ```bash
-uv run chittam install-harnesses   # Antigravity + Codex + Claude Code
+uv run chittam install-harnesses   # registers MCP + writes CHITTAM.md & routing blocks in GEMINI.md, CLAUDE.md, AGENTS.md
+uv run chittam install-rules --file /path/to/repo/AGENTS.md  # optional: also wire a specific repo's AGENTS.md
 uv run chittam watch               # real-time FSEvents/inotify incremental sync
 uv run chittam install-launchd     # macOS: periodic safety-net sync every 30 minutes
 ```
 
-Undo at any time with `uv run chittam uninstall-harnesses` and `uv run chittam uninstall-launchd`.
+Every MCP-compliant client also receives pull-only routing `instructions` directly during the `chittam-mcp` handshake. Undo at any time with `uv run chittam uninstall-harnesses --remove-rules` and `uv run chittam uninstall-launchd`.
 
 Optional companions:
 
@@ -127,7 +128,8 @@ uv tool install leann-core --with leann       # compact vector index export
 | `chittam doctor` | Non-destructive diagnostics across config, SQLite/USearch parity, Ollama, TCC, and harnesses |
 | `chittam compact` | Prune orphan vector blobs, compact USearch, checkpoint WAL, and `VACUUM` SQLite |
 | `chittam reindex-vectors` | Rebuild `vectors.usearch` completely offline from SQLite |
-| `chittam install-harnesses` / `uninstall-harnesses` | Wire or unwire MCP in all three agents |
+| `chittam install-harnesses` / `uninstall-harnesses` | Wire/unwire MCP in Antigravity, Codex, Claude Code (`--with-rules` by default) |
+| `chittam install-rules` / `uninstall-rules` | Write `~/.config/chittam/CHITTAM.md` and wire routing blocks into `GEMINI.md`, `CLAUDE.md`, `AGENTS.md` |
 | `chittam install-launchd` / `uninstall-launchd` | Enable or disable scheduled sync (macOS) |
 | `chittam benchmark [--synthetic] [--rerank]` | Measure retrieval quality, latency, and privacy leakage |
 | `chittam mcp` | Run the MCP server on stdio |

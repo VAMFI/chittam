@@ -20,9 +20,10 @@ from chittam.providers import (
     build_query_embedding_provider,
     build_rerank_provider,
 )
+from chittam.rules import MCP_SERVER_INSTRUCTIONS
 from chittam.store import ChittamStore, decision_embedding_text
 
-mcp = MCPServer("chittam")
+mcp = MCPServer("chittam", instructions=MCP_SERVER_INSTRUCTIONS)
 
 
 def _try_embed_query(

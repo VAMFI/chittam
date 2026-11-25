@@ -393,13 +393,21 @@ def reindex_vectors_cmd(
 
 @app.command("install-harnesses")
 def install_harnesses_cmd(
+    with_rules: bool = typer.Option(
+        True,
+        "--with-rules/--no-rules",
+        help="Also write ~/.config/chittam/CHITTAM.md and add the managed routing block to GEMINI.md, CLAUDE.md, and AGENTS.md.",
+    ),
     config: Path | None = typer.Option(None, "--config", "-c", help="Override config YAML path."),
 ) -> None:
-    """Register Chittam and CodeGraph MCP servers in Antigravity, Codex, and Claude Code."""
+    """Register Chittam and CodeGraph MCP servers (and optional routing rules) across harnesses."""
     from chittam.harnesses import install_harnesses
+    from chittam.rules import install_rules
 
     cfg = _load_cfg(config)
     result = install_harnesses(cfg)
+    if with_rules:
+        result["rules"] = install_rules(cfg)
     typer.echo(json.dumps(result, indent=2))
 
 
@@ -410,13 +418,71 @@ def uninstall_harnesses_cmd(
         "--restore-backup",
         help="Restore pre-install backups instead of selectively removing Chittam/CodeGraph.",
     ),
+    remove_rules: bool = typer.Option(
+        False,
+        "--remove-rules",
+        help="Also remove the managed Chittam routing block from GEMINI.md, CLAUDE.md, and AGENTS.md.",
+    ),
     config: Path | None = typer.Option(None, "--config", "-c", help="Override config YAML path."),
 ) -> None:
     """Restore or cleanly remove Chittam/CodeGraph MCP entries from harness configs."""
     from chittam.harnesses import uninstall_harnesses
+    from chittam.rules import uninstall_rules
 
     cfg = _load_cfg(config)
     result = uninstall_harnesses(cfg, restore_backup=restore_backup)
+    if remove_rules:
+        result["rules"] = uninstall_rules(cfg)
+    typer.echo(json.dumps(result, indent=2))
+
+
+@app.command("install-rules")
+def install_rules_cmd(
+    extra_files: list[Path] = typer.Option(
+        [],
+        "--file",
+        "-f",
+        help="Additional instruction file(s) (e.g., a project's AGENTS.md or CLAUDE.md) to wire.",
+    ),
+    no_create: bool = typer.Option(
+        False,
+        "--no-create",
+        help="Only update existing rule files instead of creating missing global rule files.",
+    ),
+    config: Path | None = typer.Option(None, "--config", "-c", help="Override config YAML path."),
+) -> None:
+    """Write ~/.config/chittam/CHITTAM.md and wire managed routing rules into agent instruction files."""
+    from chittam.rules import install_rules
+
+    cfg = _load_cfg(config)
+    result = install_rules(cfg, extra_files=extra_files or None, create_missing=not no_create)
+    typer.echo(json.dumps(result, indent=2))
+
+
+@app.command("uninstall-rules")
+def uninstall_rules_cmd(
+    extra_files: list[Path] = typer.Option(
+        [],
+        "--file",
+        "-f",
+        help="Additional instruction file(s) (e.g., a project's AGENTS.md) to clean up.",
+    ),
+    remove_chittam_md: bool = typer.Option(
+        False,
+        "--remove-chittam-md",
+        help="Also remove ~/.config/chittam/CHITTAM.md.",
+    ),
+    config: Path | None = typer.Option(None, "--config", "-c", help="Override config YAML path."),
+) -> None:
+    """Remove the managed Chittam routing block from agent instruction files."""
+    from chittam.rules import uninstall_rules
+
+    cfg = _load_cfg(config)
+    result = uninstall_rules(
+        cfg,
+        extra_files=extra_files or None,
+        remove_chittam_md=remove_chittam_md,
+    )
     typer.echo(json.dumps(result, indent=2))
 
 

@@ -8,5 +8,5 @@ Keep system prompts static to preserve prompt caching—never preload memory dum
 2. **CodeGraph** (`codegraph_explore`, `codegraph_node`, call-graph queries):
    Use for structural architecture, callers/callees, and blast-radius analysis inside an indexed repo.
 
-3. **Chittam** (`memory_search`, `project_atlas`, `recall_threads`, `record_decision`):
-   Use for cross-repo discovery, conceptual questions, active-vs-archived repo disambiguation (`project_atlas`), screenshots/diagrams/PDFs, prior Antigravity/Codex/Claude threads (`recall_threads`), and persisting architectural choices (`record_decision`).
+3. **Chittam** (`memory_search`, `memory_get_chunk`, `project_atlas`, `recall_threads`, `record_decision`):
+   Use for cross-repo discovery, conceptual questions, active-vs-archived repo disambiguation (`project_atlas`), screenshots/diagrams/PDFs, prior Antigravity/Codex/Claude threads (`recall_threads`), and persisting architectural choices (`record_decision`). Only call `memory_get_chunk` for the 1–3 chunks needed after `memory_search`.

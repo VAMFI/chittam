@@ -126,15 +126,21 @@ Then run `uv run chittam sync` so documents pick up the new tier.
 uv run chittam install-harnesses
 ```
 
-This backs up and edits:
+This does two things cleanly (creating timestamped backups in `~/.local/share/chittam/backups/` first):
 
-| Agent | Config file |
-| :--- | :--- |
-| Antigravity | `~/.gemini/config/mcp_config.json` |
-| Codex | `~/.codex/config.toml` |
-| Claude Code | `~/.claude.json` |
+1. **Registers MCP servers** in each agent's config:
 
-Restart each agent so it loads the new MCP servers. Then paste the contents of [`docs/ROUTING_RULE.md`](ROUTING_RULE.md) into each agent's global instructions (for example `AGENTS.md`, `CLAUDE.md`, or a rule/skill). It's under 150 words, so it costs almost nothing per turn and never changes between turns, which keeps prompt caching intact.
+| Agent | MCP Config File | Global Instruction File Updated |
+| :--- | :--- | :--- |
+| Antigravity | `~/.gemini/config/mcp_config.json` | `~/.gemini/GEMINI.md` |
+| Codex | `~/.codex/config.toml` | `~/.codex/AGENTS.md` |
+| Claude Code | `~/.claude.json` | `~/.claude/CLAUDE.md` |
+
+2. **Writes `~/.config/chittam/CHITTAM.md` and wires a reversible `<!-- chittam:start --> ... <!-- chittam:end -->` routing block** into those global instruction files so agents actively call Chittam for off-repo docs/PDFs/screenshots, cross-agent threads (`recall_threads`), canonical repo lookup (`project_atlas`), and durable decisions (`record_decision`), while keeping native `ripgrep` for live code inside the active repo.
+
+> **Using another agent or want per-repo activation?**
+> - **Automatic MCP instructions**: `chittam-mcp` sends pull-only routing `instructions` directly in the MCP `initialize` handshake, so any MCP client (Cursor, Windsurf, Zed, etc.) gets the guidance automatically.
+> - **Per-repo `AGENTS.md` / `CLAUDE.md`**: Run `uv run chittam install-rules --file /path/to/repo/AGENTS.md` (or paste [`docs/ROUTING_RULE.md`](ROUTING_RULE.md) directly). It stays under 150 words and never changes between turns, keeping prompt caching intact.
 
 **Using a different MCP client?** Point it at:
 
@@ -142,7 +148,7 @@ Restart each agent so it loads the new MCP servers. Then paste the contents of [
 { "command": "/path/to/chittam/.venv/bin/chittam-mcp", "args": [] }
 ```
 
-**Undo:** `uv run chittam uninstall-harnesses`. Backups stay in `~/.local/share/chittam/backups/`.
+**Undo:** `uv run chittam uninstall-harnesses --remove-rules` (or `uv run chittam uninstall-rules --remove-chittam-md`). Backups stay in `~/.local/share/chittam/backups/`.
 
 ## 5. Keep the index fresh (watch + scheduled sync)
 
@@ -277,7 +283,8 @@ Pull and run `uv sync`, then run `uv run chittam sync && uv run chittam compact`
 **Removing Chittam completely:**
 
 ```bash
-uv run chittam uninstall-harnesses
+uv run chittam uninstall-harnesses --remove-rules
+uv run chittam uninstall-rules --remove-chittam-md
 uv run chittam uninstall-launchd
 rm -rf ~/.local/share/chittam ~/.config/chittam
 # optionally: ollama rm embeddinggemma qwen3-vl:2b

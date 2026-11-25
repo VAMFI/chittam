@@ -184,6 +184,9 @@ class HarnessesConfig(BaseModel):
     antigravity_mcp_path: str = "~/.gemini/config/mcp_config.json"
     codex_config_path: str = "~/.codex/config.toml"
     claude_config_path: str = "~/.claude.json"
+    antigravity_rules_path: str = "~/.gemini/GEMINI.md"
+    claude_rules_path: str = "~/.claude/CLAUDE.md"
+    codex_rules_path: str = "~/.codex/AGENTS.md"
     antigravity_brain_dir: str = "~/.gemini/antigravity/brain"
     codex_home_dir: str = "~/.codex"
     codex_legacy_memories_dirs: list[str] = Field(default_factory=list)
@@ -215,6 +218,10 @@ class AppConfig(BaseModel):
     @property
     def atlas_path(self) -> Path:
         return Path(self.config_dir).expanduser() / "canonical-projects.yaml"
+
+    @property
+    def chittam_md_path(self) -> Path:
+        return Path(self.config_dir).expanduser() / "CHITTAM.md"
 
     @property
     def backup_dir(self) -> Path:
