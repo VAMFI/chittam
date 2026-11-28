@@ -259,8 +259,29 @@ def _check_harnesses(cfg: AppConfig) -> dict[str, Any]:
     }
 
 
+def _tail_sync_log_issues(data_dir: Path) -> list[str]:
+    log_path = data_dir / "sync.log"
+    if not log_path.exists():
+        return []
+    try:
+        size = log_path.stat().st_size
+        with log_path.open("rb") as fh:
+            if size > 16384:
+                fh.seek(-16384, os.SEEK_END)
+            tail = fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return []
+    issues: list[str] = []
+    if "OperationalError: database is locked" in tail:
+        issues.append("database is locked")
+    if "PermissionError" in tail or "Operation not permitted" in tail:
+        issues.append("TCC/permission error")
+    return issues
+
+
 def _check_background_sync(cfg: AppConfig) -> dict[str, Any]:
-    lock_path = Path(cfg.data_dir).expanduser() / "sync.lock"
+    data_dir = Path(cfg.data_dir).expanduser()
+    lock_path = data_dir / "sync.lock"
     sync_active = False
     if lock_path.exists():
         try:
@@ -273,21 +294,34 @@ def _check_background_sync(cfg: AppConfig) -> dict[str, Any]:
         except OSError:
             pass
 
+    log_issues = _tail_sync_log_issues(data_dir)
+
     if sys.platform == "darwin":
         from chittam.launchd import launchd_status
 
         st = launchd_status()
         installed = bool(st.get("installed"))
         loaded = bool(st.get("loaded"))
+        exit_code = st.get("last_exit_status")
         detail = (
             f"launchd installed={installed} loaded={loaded} "
             f"interval={st.get('start_interval')}s active_sync={sync_active}"
         )
+        if exit_code not in (None, 0):
+            detail += f" last_exit={exit_code}"
+        if log_issues:
+            detail += f" log_warnings=[{', '.join(log_issues)}]"
+        status = "ok" if (loaded and not log_issues and exit_code in (None, 0)) else "warn"
+        hint = None
+        if not loaded:
+            hint = "Run `chittam install-launchd` or `chittam watch`"
+        elif log_issues or exit_code not in (None, 0):
+            hint = f"Inspect {data_dir / 'sync.log'} (check Full Disk Access if TCC errors appear)"
         return {
             "name": "background_sync",
-            "status": "ok" if loaded else "warn",
+            "status": status,
             "detail": detail,
-            "hint": None if loaded else "Run `chittam install-launchd` or `chittam watch`",
+            "hint": hint,
         }
     return {
         "name": "background_sync",

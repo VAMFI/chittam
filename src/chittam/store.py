@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import math
+import os
 import re
 import sqlite3
 import threading
+import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import numpy as np
 
@@ -35,10 +39,113 @@ from chittam.vector_index import (
 )
 
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+_QUOTED_PHRASE_RE = re.compile(r'"([^"]+)"')
+_HYPHEN_IDENT_RE = re.compile(r"\b[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+\b")
 _MAX_FTS_TOKENS = 24
 _MAX_SNIPPET_CHARS = 350
 _RRF_K = 20.0
 _SCHEMA_VERSION = "2"
+
+_FTS_OPERATORS = frozenset({"AND", "OR", "NOT", "NEAR"})
+_STOPWORDS = frozenset(
+    {
+        "a", "an", "and", "are", "as", "at", "be", "been", "but", "by",
+        "can", "could", "did", "do", "does", "for", "from", "had", "has",
+        "have", "he", "her", "here", "him", "his", "how", "i", "if", "in",
+        "into", "is", "it", "its", "just", "me", "more", "most", "my", "no",
+        "not", "of", "on", "or", "our", "out", "she", "should", "so", "some",
+        "such", "than", "that", "the", "their", "them", "then", "there",
+        "these", "they", "this", "those", "through", "to", "too", "up",
+        "us", "was", "we", "were", "what", "when", "where", "which", "who",
+        "why", "will", "with", "would", "you", "your",
+    }
+)
+
+_PROCESS_LOCKS_GUARD = threading.Lock()
+_PROCESS_LOCKS: dict[str, tuple[Any, int]] = {}
+
+
+@contextmanager
+def file_lock(
+    lock_path: Path | str,
+    *,
+    blocking: bool = True,
+    timeout: float = 30.0,
+) -> Iterator[None]:
+    """Process-reentrant advisory flock keyed by resolved `lock_path`."""
+    resolved = Path(lock_path).expanduser().resolve(strict=False)
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    key = str(resolved)
+    acquired_flock = False
+    fh: Any = None
+
+    with _PROCESS_LOCKS_GUARD:
+        existing = _PROCESS_LOCKS.get(key)
+        if existing is not None:
+            fh, count = existing
+            _PROCESS_LOCKS[key] = (fh, count + 1)
+            fh_ref = fh
+        else:
+            fh_ref = None
+
+    if fh_ref is not None:
+        try:
+            yield
+        finally:
+            with _PROCESS_LOCKS_GUARD:
+                cur = _PROCESS_LOCKS.get(key)
+                if cur is not None:
+                    cur_fh, cur_count = cur
+                    if cur_count <= 1:
+                        _PROCESS_LOCKS.pop(key, None)
+                        try:
+                            fcntl.flock(cur_fh.fileno(), fcntl.LOCK_UN)
+                        except OSError:
+                            pass
+                        cur_fh.close()
+                    else:
+                        _PROCESS_LOCKS[key] = (cur_fh, cur_count - 1)
+        return
+
+    fh = resolved.open("a+", encoding="utf-8")
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    try:
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired_flock = True
+                break
+            except BlockingIOError:
+                if not blocking:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"Timed out waiting for lock: {resolved}")
+                time.sleep(0.05)
+
+        with _PROCESS_LOCKS_GUARD:
+            _PROCESS_LOCKS[key] = (fh, 1)
+
+        yield
+    finally:
+        if acquired_flock:
+            with _PROCESS_LOCKS_GUARD:
+                cur = _PROCESS_LOCKS.get(key)
+                if cur is not None:
+                    cur_fh, cur_count = cur
+                    if cur_count <= 1:
+                        _PROCESS_LOCKS.pop(key, None)
+                        try:
+                            fcntl.flock(cur_fh.fileno(), fcntl.LOCK_UN)
+                        except OSError:
+                            pass
+                        cur_fh.close()
+                    else:
+                        _PROCESS_LOCKS[key] = (cur_fh, cur_count - 1)
+        else:
+            try:
+                fh.close()
+            except OSError:
+                pass
 
 _HARNESS_ALIASES: dict[str, tuple[str, ...]] = {
     "antigravity": ("antigravity",),
@@ -62,26 +169,85 @@ _REQUIRED_TABLES = {
 }
 
 
-def sanitize_fts5_query(query: str) -> tuple[str | None, list[str]]:
-    """Convert arbitrary user text into a safe FTS5 MATCH query and token list."""
-    raw_tokens = _TOKEN_RE.findall(query or "")
-    seen: set[str] = set()
-    tokens: list[str] = []
-    for tok in raw_tokens:
+def build_fts5_queries(query: str) -> tuple[str | None, str | None, list[str], list[str]]:
+    """Build (strict_expr, broad_expr, content_tokens, phrases) preserving phrases and hyphenated IDs."""
+    raw = query or ""
+    phrases: list[str] = []
+    phrase_clauses: list[str] = []
+    seen_clauses: set[str] = set()
+
+    def _add_phrase(inner_text: str) -> None:
+        words = [w.replace('"', "").strip() for w in _TOKEN_RE.findall(inner_text) if w.replace('"', "").strip()]
+        if not words:
+            return
+        joined = " ".join(words)
+        low = joined.lower()
+        if low in seen_clauses:
+            return
+        seen_clauses.add(low)
+        if len(words) > 1:
+            phrases.append(low)
+        phrase_clauses.append(f'"{joined}"')
+
+    # 1. Extract complete double-quoted phrases
+    def _consume_quoted(match: re.Match[str]) -> str:
+        _add_phrase(match.group(1))
+        return " "
+
+    remainder = _QUOTED_PHRASE_RE.sub(_consume_quoted, raw)
+
+    # 2. Extract hyphenated identifiers (e.g. PROJ-005, acme-v2, desktop-uninstall-notes)
+    def _consume_hyphen(match: re.Match[str]) -> str:
+        _add_phrase(match.group(0))
+        return " "
+
+    remainder = _HYPHEN_IDENT_RE.sub(_consume_hyphen, remainder)
+
+    # 3. Extract remaining tokens (dropping FTS boolean keywords)
+    raw_tokens: list[str] = []
+    seen_raw: set[str] = set()
+    for tok in _TOKEN_RE.findall(remainder):
         cleaned = tok.replace('"', "").strip()
-        if not cleaned:
+        if not cleaned or cleaned in _FTS_OPERATORS:
             continue
         low = cleaned.lower()
-        if low in seen:
+        if low in seen_raw:
             continue
-        seen.add(low)
-        tokens.append(cleaned)
-        if len(tokens) >= _MAX_FTS_TOKENS:
-            break
-    if not tokens:
-        return None, []
-    fts_expr = " OR ".join(f'"{t}"' for t in tokens)
-    return fts_expr, tokens
+        seen_raw.add(low)
+        raw_tokens.append(cleaned)
+
+    filtered_tokens = [t for t in raw_tokens if t.lower() not in _STOPWORDS]
+    content_tokens = filtered_tokens if filtered_tokens else raw_tokens
+
+    token_clauses: list[str] = []
+    for tok in content_tokens:
+        low = tok.lower()
+        if low in seen_clauses:
+            continue
+        seen_clauses.add(low)
+        token_clauses.append(f'"{tok}"')
+
+    clauses = (phrase_clauses + token_clauses)[:_MAX_FTS_TOKENS]
+    if not clauses:
+        return None, None, [], []
+
+    broad_expr = " OR ".join(clauses)
+    strict_expr = " AND ".join(clauses) if 2 <= len(clauses) <= 6 else None
+
+    # Expand highlight/snippet tokens to include phrase sub-tokens when needed
+    highlight_tokens: list[str] = list(content_tokens)
+    for ph in phrases:
+        for w in ph.split():
+            if w.lower() not in _STOPWORDS and w not in highlight_tokens:
+                highlight_tokens.append(w)
+
+    return strict_expr, broad_expr, highlight_tokens[:_MAX_FTS_TOKENS], phrases
+
+
+def sanitize_fts5_query(query: str) -> tuple[str | None, list[str]]:
+    """Convert arbitrary user text into a safe FTS5 MATCH query and token list."""
+    _strict, broad_expr, tokens, _phrases = build_fts5_queries(query)
+    return broad_expr, tokens
 
 
 def _content_sha256(text: str) -> str:
@@ -192,6 +358,9 @@ class ChittamStore:
         self._lock = threading.RLock()
         self._vec_index: VectorIndex | None = None
         self._vec_dirty = False
+        self._pending_vec_removals: set[int] = set()
+        self._vector_lock_path = self.vector_index_path.with_name(f"{self.vector_index_path.name}.lock")
+        self._sync_lock_path = self.db_path.parent / "sync.lock"
         self.conn = sqlite3.connect(
             str(self.db_path),
             timeout=30.0,
@@ -250,7 +419,7 @@ class ChittamStore:
             if (
                 _REQUIRED_TABLES.issubset(existing_tables)
                 and {"file_mtime_ns", "file_size"}.issubset(doc_cols)
-                and "content_sha256" in chunk_cols
+                and {"content_sha256", "fts_rowid"}.issubset(chunk_cols)
             ):
                 return
 
@@ -288,7 +457,8 @@ class ChittamStore:
                     line_end INTEGER,
                     token_estimate INTEGER NOT NULL DEFAULT 0,
                     metadata_json TEXT NOT NULL DEFAULT '{}',
-                    content_sha256 TEXT
+                    content_sha256 TEXT,
+                    fts_rowid INTEGER
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_chunks_doc_idx ON chunks(doc_id, chunk_index);
@@ -377,6 +547,8 @@ class ChittamStore:
             chunk_cols = {r[1] for r in self.conn.execute("PRAGMA table_info(chunks)").fetchall()}
             if "content_sha256" not in chunk_cols:
                 self.conn.execute("ALTER TABLE chunks ADD COLUMN content_sha256 TEXT;")
+            if "fts_rowid" not in chunk_cols:
+                self.conn.execute("ALTER TABLE chunks ADD COLUMN fts_rowid INTEGER;")
 
             self.conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_chunks_content_sha ON chunks(content_sha256);"
@@ -404,8 +576,41 @@ class ChittamStore:
         )
 
     def _flush_vec_index(self) -> None:
-        if self._vec_dirty and self._vec_index is not None:
-            self._vec_index.save()
+        if not (self._vec_dirty or self._pending_vec_removals):
+            return
+        pending = sorted(self._pending_vec_removals)
+        if self.vector_backend == "numpy":
+            if self._vec_index is not None and pending:
+                self._vec_index.remove(pending)
+            self._pending_vec_removals.clear()
+            self._vec_dirty = False
+            return
+
+        with file_lock(self._vector_lock_path, blocking=True, timeout=30.0):
+            idx = self._vec_index
+            if idx is None and pending and self.vector_index_path.exists():
+                meta = self.get_index_meta()
+                dim_raw = meta.get("active_embedding_dim")
+                dt = meta.get("vector_dtype", self.vector_dtype)
+                if dim_raw:
+                    try:
+                        idx = build_vector_index(
+                            self.vector_index_path,
+                            dim=int(dim_raw),
+                            dtype=dt,
+                            backend="usearch",
+                        )
+                        self._vec_index = idx
+                    except Exception:
+                        idx = None
+            elif idx is not None:
+                idx.reload_if_changed()
+
+            if idx is not None:
+                if pending:
+                    idx.remove(pending)
+                idx.save()
+            self._pending_vec_removals.clear()
             self._vec_dirty = False
 
     def flush_vector_index(self) -> None:
@@ -542,6 +747,119 @@ class ChittamStore:
                 for row in rows
             }
 
+    def get_document_projects(self) -> dict[str, str | None]:
+        """Return {doc_id: project_id} for lightweight metadata diffing."""
+        with self._lock:
+            rows = self.conn.execute("SELECT doc_id, project_id FROM documents").fetchall()
+            return {str(r["doc_id"]): r["project_id"] for r in rows}
+
+    def update_document_metadata(
+        self,
+        doc_id: str,
+        *,
+        project_id: str | None,
+        canonical_tier: RepoTier | str,
+        file_mtime_ns: int | None = None,
+        file_size: int | None = None,
+    ) -> None:
+        """Update document project/tier metadata in-place without rewriting chunks or vectors."""
+        tier_val = canonical_tier.value if isinstance(canonical_tier, RepoTier) else str(canonical_tier)
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT project_id, title, source_harness FROM documents WHERE doc_id = ?",
+                (doc_id,),
+            ).fetchone()
+            if row is None:
+                return
+            old_proj = row["project_id"]
+            if file_mtime_ns is not None and file_size is not None:
+                self.conn.execute(
+                    """
+                    UPDATE documents
+                    SET project_id = ?, canonical_tier = ?, file_mtime_ns = ?, file_size = ?
+                    WHERE doc_id = ?
+                    """,
+                    (project_id, tier_val, int(file_mtime_ns), int(file_size), doc_id),
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE documents SET project_id = ?, canonical_tier = ? WHERE doc_id = ?",
+                    (project_id, tier_val, doc_id),
+                )
+            if old_proj != project_id:
+                chunk_rows = self.conn.execute(
+                    "SELECT chunk_id, contextual_header, content, fts_rowid FROM chunks WHERE doc_id = ?",
+                    (doc_id,),
+                ).fetchall()
+                fts_ids = [int(r["fts_rowid"]) for r in chunk_rows if r["fts_rowid"] is not None]
+                if fts_ids and len(fts_ids) == len(chunk_rows):
+                    ph = ", ".join("?" for _ in fts_ids)
+                    self.conn.execute(f"DELETE FROM chunks_fts WHERE rowid IN ({ph})", fts_ids)
+                else:
+                    self.conn.execute("DELETE FROM chunks_fts WHERE doc_id = ?", (doc_id,))
+                if chunk_rows:
+                    upd_fts: list[tuple[int, str]] = []
+                    for r in chunk_rows:
+                        cur = self.conn.execute(
+                            """
+                            INSERT INTO chunks_fts (
+                                chunk_id, doc_id, contextual_header, content, title, project_id, source_harness
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                r["chunk_id"],
+                                doc_id,
+                                r["contextual_header"],
+                                r["content"],
+                                row["title"],
+                                project_id or "",
+                                row["source_harness"],
+                            ),
+                        )
+                        upd_fts.append((int(cur.lastrowid), str(r["chunk_id"])))
+                    self.conn.executemany(
+                        "UPDATE chunks SET fts_rowid = ? WHERE chunk_id = ?",
+                        upd_fts,
+                    )
+
+    def needs_compaction(
+        self,
+        *,
+        freelist_ratio: float = 0.15,
+        orphan_threshold: int = 5000,
+        min_db_bytes: int = 10 * 1024 * 1024,
+    ) -> bool:
+        """Return True when SQLite freelist bloat or orphan embedding count exceeds thresholds."""
+        if not self.db_path.exists():
+            return False
+        try:
+            if self.db_path.stat().st_size < min_db_bytes:
+                return False
+        except OSError:
+            return False
+        with self._lock:
+            page_count = int(self.conn.execute("PRAGMA page_count;").fetchone()[0])
+            freelist = int(self.conn.execute("PRAGMA freelist_count;").fetchone()[0])
+            if page_count > 0 and (freelist / page_count) >= float(freelist_ratio):
+                return True
+            if orphan_threshold > 0:
+                orphans = int(
+                    self.conn.execute(
+                        """
+                        SELECT COUNT(*) FROM content_embeddings ce
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM vector_entries ve
+                            WHERE ve.content_sha256 = ce.content_sha256
+                              AND +ve.model = ce.model
+                              AND +ve.dim = ce.dim
+                        )
+                        """
+                    ).fetchone()[0]
+                )
+                if orphans >= int(orphan_threshold):
+                    return True
+        return False
+
     def update_document_file_stat(
         self,
         doc_id: str,
@@ -569,28 +887,10 @@ class ChittamStore:
     def _remove_vec_keys_unlocked(self, vec_keys: list[int], save_index: bool) -> None:
         if not vec_keys:
             return
-        meta = self.get_index_meta()
-        dim_raw = meta.get("active_embedding_dim")
-        dt = meta.get("vector_dtype", self.vector_dtype)
-        idx = self._vec_index
-        if idx is None and self.vector_backend == "usearch" and self.vector_index_path.exists() and dim_raw:
-            try:
-                idx = build_vector_index(
-                    self.vector_index_path,
-                    dim=int(dim_raw),
-                    dtype=dt,
-                    backend="usearch",
-                )
-                self._vec_index = idx
-            except Exception:
-                idx = None
-        if idx is not None:
-            idx.remove(vec_keys)
-            if save_index:
-                idx.save()
-                self._vec_dirty = False
-            else:
-                self._vec_dirty = True
+        self._pending_vec_removals.update(int(k) for k in vec_keys)
+        self._vec_dirty = True
+        if save_index:
+            self._flush_vec_index()
 
     def upsert_document(self, doc: DocumentRecord, *, _save_vec: bool = True) -> None:
         """Atomically insert or replace a document, its chunks, FTS5 rows, and vector entries."""
@@ -616,7 +916,7 @@ class ChittamStore:
                 old_key_rows = self.conn.execute(
                     """
                     SELECT vec_key FROM vector_entries
-                    WHERE target_type = 'chunk'
+                    WHERE +target_type = 'chunk'
                       AND target_id IN (SELECT chunk_id FROM chunks WHERE doc_id = ?)
                     """,
                     (doc.doc_id,),
@@ -626,12 +926,22 @@ class ChittamStore:
                     self.conn.execute(
                         """
                         DELETE FROM vector_entries
-                        WHERE target_type = 'chunk'
+                        WHERE +target_type = 'chunk'
                           AND target_id IN (SELECT chunk_id FROM chunks WHERE doc_id = ?)
                         """,
                         (doc.doc_id,),
                     )
-                self.conn.execute("DELETE FROM chunks_fts WHERE doc_id = ?", (doc.doc_id,))
+                fts_rows_existing = self.conn.execute(
+                    "SELECT fts_rowid FROM chunks WHERE doc_id = ?",
+                    (doc.doc_id,),
+                ).fetchall()
+                if fts_rows_existing:
+                    fts_ids = [int(r["fts_rowid"]) for r in fts_rows_existing if r["fts_rowid"] is not None]
+                    if len(fts_ids) == len(fts_rows_existing):
+                        ph = ", ".join("?" for _ in fts_ids)
+                        self.conn.execute(f"DELETE FROM chunks_fts WHERE rowid IN ({ph})", fts_ids)
+                    else:
+                        self.conn.execute("DELETE FROM chunks_fts WHERE doc_id = ?", (doc.doc_id,))
                 self.conn.execute(
                     "DELETE FROM chunk_embeddings WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE doc_id = ?)",
                     (doc.doc_id,),
@@ -664,51 +974,48 @@ class ChittamStore:
             )
 
             if doc.chunks:
-                chunk_rows = [
-                    (
-                        c.chunk_id,
-                        doc.doc_id,
-                        c.chunk_index,
-                        c.contextual_header,
-                        c.content,
-                        c.symbol_name,
-                        c.line_start,
-                        c.line_end,
-                        c.token_estimate,
-                        json.dumps(c.metadata, ensure_ascii=False),
-                        _content_sha256(c.content),
+                chunk_rows = []
+                for c in doc.chunks:
+                    cur = self.conn.execute(
+                        """
+                        INSERT INTO chunks_fts (
+                            chunk_id, doc_id, contextual_header, content, title, project_id, source_harness
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            c.chunk_id,
+                            doc.doc_id,
+                            c.contextual_header,
+                            c.content,
+                            doc.title,
+                            doc.project_id or "",
+                            doc.source_harness,
+                        ),
                     )
-                    for c in doc.chunks
-                ]
+                    chunk_rows.append(
+                        (
+                            c.chunk_id,
+                            doc.doc_id,
+                            c.chunk_index,
+                            c.contextual_header,
+                            c.content,
+                            c.symbol_name,
+                            c.line_start,
+                            c.line_end,
+                            c.token_estimate,
+                            json.dumps(c.metadata, ensure_ascii=False),
+                            _content_sha256(c.content),
+                            int(cur.lastrowid),
+                        )
+                    )
                 self.conn.executemany(
                     """
                     INSERT OR REPLACE INTO chunks (
                         chunk_id, doc_id, chunk_index, contextual_header, content,
-                        symbol_name, line_start, line_end, token_estimate, metadata_json, content_sha256
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        symbol_name, line_start, line_end, token_estimate, metadata_json, content_sha256, fts_rowid
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     chunk_rows,
-                )
-
-                fts_rows = [
-                    (
-                        c.chunk_id,
-                        doc.doc_id,
-                        c.contextual_header,
-                        c.content,
-                        doc.title,
-                        doc.project_id or "",
-                        doc.source_harness,
-                    )
-                    for c in doc.chunks
-                ]
-                self.conn.executemany(
-                    """
-                    INSERT INTO chunks_fts (
-                        chunk_id, doc_id, contextual_header, content, title, project_id, source_harness
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    fts_rows,
                 )
 
             if removed_keys:
@@ -720,7 +1027,7 @@ class ChittamStore:
             old_key_rows = self.conn.execute(
                 """
                 SELECT vec_key FROM vector_entries
-                WHERE target_type = 'chunk'
+                WHERE +target_type = 'chunk'
                   AND target_id IN (SELECT chunk_id FROM chunks WHERE doc_id = ?)
                 """,
                 (doc_id,),
@@ -730,12 +1037,22 @@ class ChittamStore:
                 self.conn.execute(
                     """
                     DELETE FROM vector_entries
-                    WHERE target_type = 'chunk'
+                    WHERE +target_type = 'chunk'
                       AND target_id IN (SELECT chunk_id FROM chunks WHERE doc_id = ?)
                     """,
                     (doc_id,),
                 )
-            self.conn.execute("DELETE FROM chunks_fts WHERE doc_id = ?", (doc_id,))
+            fts_rows_existing = self.conn.execute(
+                "SELECT fts_rowid FROM chunks WHERE doc_id = ?",
+                (doc_id,),
+            ).fetchall()
+            if fts_rows_existing:
+                fts_ids = [int(r["fts_rowid"]) for r in fts_rows_existing if r["fts_rowid"] is not None]
+                if len(fts_ids) == len(fts_rows_existing):
+                    ph = ", ".join("?" for _ in fts_ids)
+                    self.conn.execute(f"DELETE FROM chunks_fts WHERE rowid IN ({ph})", fts_ids)
+                else:
+                    self.conn.execute("DELETE FROM chunks_fts WHERE doc_id = ?", (doc_id,))
             self.conn.execute(
                 "DELETE FROM chunk_embeddings WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE doc_id = ?)",
                 (doc_id,),
@@ -750,15 +1067,33 @@ class ChittamStore:
         self,
         keep_doc_ids: set[str],
         preserve_media_types: set[str] | None = None,
+        preserve_uri_prefixes: set[str] | None = None,
+        preserve_harnesses: set[str] | None = None,
     ) -> int:
-        """Remove documents not in keep_doc_ids (optionally preserving certain media types)."""
+        """Remove documents not in keep_doc_ids (preserving protected media, prefixes, or harnesses)."""
         preserved = preserve_media_types or set()
+        preserved_harnesses = preserve_harnesses or set()
+        prefixes = tuple(p.rstrip("/") for p in (preserve_uri_prefixes or ()) if p)
+
+        def _matches_prefix(uri: str) -> bool:
+            if not prefixes:
+                return False
+            for pref in prefixes:
+                if uri == pref or uri.startswith(pref + "/"):
+                    return True
+            return False
+
         with self._lock:
-            rows = self.conn.execute("SELECT doc_id, media_type FROM documents").fetchall()
+            rows = self.conn.execute(
+                "SELECT doc_id, uri, media_type, source_harness FROM documents"
+            ).fetchall()
             to_delete = [
                 row["doc_id"]
                 for row in rows
-                if row["doc_id"] not in keep_doc_ids and row["media_type"] not in preserved
+                if row["doc_id"] not in keep_doc_ids
+                and row["media_type"] not in preserved
+                and row["source_harness"] not in preserved_harnesses
+                and not _matches_prefix(str(row["uri"]))
             ]
         deleted = 0
         for doc_id in to_delete:
@@ -868,10 +1203,15 @@ class ChittamStore:
                 }
             )
 
-        idx = self._ensure_vec_index_for_write(dim=int(dim), dtype=dt)
         mat = decode_stored_array(blobs, dim=int(dim), dtype=dt)
-        idx.add(keys, mat)
-        idx.save()
+        with file_lock(self._vector_lock_path, blocking=True, timeout=30.0):
+            idx = self._ensure_vec_index_for_write(dim=int(dim), dtype=dt)
+            if self._pending_vec_removals:
+                idx.remove(sorted(self._pending_vec_removals))
+                self._pending_vec_removals.clear()
+            idx.add(keys, mat)
+            idx.save()
+            self._vec_dirty = False
         return len(keys)
 
     def get_chunks_missing_embeddings(
@@ -1046,9 +1386,15 @@ class ChittamStore:
             )
 
         if keys_to_add:
-            idx = self._ensure_vec_index_for_write(dim=dim, dtype=dt)
-            idx.add(keys_to_add, np.vstack(vecs_to_add))
-            idx.save()
+            stacked = np.vstack(vecs_to_add)
+            with file_lock(self._vector_lock_path, blocking=True, timeout=30.0):
+                idx = self._ensure_vec_index_for_write(dim=dim, dtype=dt)
+                if self._pending_vec_removals:
+                    idx.remove(sorted(self._pending_vec_removals))
+                    self._pending_vec_removals.clear()
+                idx.add(keys_to_add, stacked)
+                idx.save()
+                self._vec_dirty = False
         return len(keys_to_add)
 
     def upsert_decision_embedding(
@@ -1115,9 +1461,14 @@ class ChittamStore:
                 }
             )
 
-        idx = self._ensure_vec_index_for_write(dim=dim, dtype=dt)
-        idx.add([vec_key], q_arr)
-        idx.save()
+        with file_lock(self._vector_lock_path, blocking=True, timeout=30.0):
+            idx = self._ensure_vec_index_for_write(dim=dim, dtype=dt)
+            if self._pending_vec_removals:
+                idx.remove(sorted(self._pending_vec_removals))
+                self._pending_vec_removals.clear()
+            idx.add([vec_key], q_arr)
+            idx.save()
+            self._vec_dirty = False
 
     def get_decisions_missing_embeddings(
         self,
@@ -1327,31 +1678,37 @@ class ChittamStore:
 
     def rebuild_vector_index(self) -> dict[str, Any]:
         """Rebuild vectors.usearch completely offline from SQLite vector_entries and content_embeddings."""
-        with self._lock:
-            meta = self.get_index_meta()
-            dim_raw = meta.get("active_embedding_dim")
-            dt = meta.get("vector_dtype", self.vector_dtype)
-            if not dim_raw:
-                row = self.conn.execute("SELECT dim FROM vector_entries LIMIT 1").fetchone()
-                if row is None:
-                    if self.vector_index_path.exists():
-                        self.vector_index_path.unlink()
-                    self._vec_index = None
-                    return {"rebuilt": 0, "dim": None, "dtype": dt, "vector_index_bytes": 0}
-                dim_raw = str(row["dim"])
-            dim = int(dim_raw)
+        with file_lock(self._sync_lock_path, blocking=True, timeout=60.0):
+            with self._lock:
+                meta = self.get_index_meta()
+                dim_raw = meta.get("active_embedding_dim")
+                dt = meta.get("vector_dtype", self.vector_dtype)
+                if not dim_raw:
+                    row = self.conn.execute("SELECT dim FROM vector_entries LIMIT 1").fetchone()
+                    if row is None:
+                        with file_lock(self._vector_lock_path, blocking=True, timeout=30.0):
+                            if self.vector_index_path.exists():
+                                self.vector_index_path.unlink()
+                        self._vec_index = None
+                        self._pending_vec_removals.clear()
+                        self._vec_dirty = False
+                        return {"rebuilt": 0, "dim": None, "dtype": dt, "vector_index_bytes": 0}
+                    dim_raw = str(row["dim"])
+                dim = int(dim_raw)
 
-            idx = build_vector_index(
-                self.vector_index_path,
-                dim=dim,
-                dtype=dt,
-                backend=self.vector_backend,
-            )
-            idx.clear()
-            rebuilt = self._populate_index_from_db_unlocked(idx, dim=dim, dtype=dt)
-            idx.save()
-            self._vec_index = idx
-            self._vec_dirty = False
+                with file_lock(self._vector_lock_path, blocking=True, timeout=30.0):
+                    idx = build_vector_index(
+                        self.vector_index_path,
+                        dim=dim,
+                        dtype=dt,
+                        backend=self.vector_backend,
+                    )
+                    idx.clear()
+                    rebuilt = self._populate_index_from_db_unlocked(idx, dim=dim, dtype=dt)
+                    idx.save()
+                self._vec_index = idx
+                self._pending_vec_removals.clear()
+                self._vec_dirty = False
 
         vec_bytes = self.vector_index_path.stat().st_size if self.vector_index_path.exists() else 0
         return {
@@ -1367,25 +1724,26 @@ class ChittamStore:
         db_before = self.db_path.stat().st_size if self.db_path.exists() else 0
         vec_before = self.vector_index_path.stat().st_size if self.vector_index_path.exists() else 0
 
-        with self._lock:
-            with self.conn:
-                cur = self.conn.execute(
-                    """
-                    DELETE FROM content_embeddings
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM vector_entries ve
-                        WHERE ve.content_sha256 = content_embeddings.content_sha256
-                          AND ve.model = content_embeddings.model
-                          AND ve.dim = content_embeddings.dim
+        with file_lock(self._sync_lock_path, blocking=True, timeout=60.0):
+            with self._lock:
+                with self.conn:
+                    cur = self.conn.execute(
+                        """
+                        DELETE FROM content_embeddings
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM vector_entries ve
+                            WHERE ve.content_sha256 = content_embeddings.content_sha256
+                              AND +ve.model = content_embeddings.model
+                              AND +ve.dim = content_embeddings.dim
+                        )
+                        """
                     )
-                    """
-                )
-                orphans_deleted = int(cur.rowcount)
+                    orphans_deleted = int(cur.rowcount)
 
-            rebuild_info = self.rebuild_vector_index()
-            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-            self.conn.execute("VACUUM;")
-            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                rebuild_info = self.rebuild_vector_index()
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                self.conn.execute("VACUUM;")
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
 
         db_after = self.db_path.stat().st_size if self.db_path.exists() else 0
         vec_after = self.vector_index_path.stat().st_size if self.vector_index_path.exists() else 0
@@ -1622,22 +1980,22 @@ class ChittamStore:
         query_vec: np.ndarray | list[float] | None = None,
         limit: int = 8,
         media_type: str | MediaType | None = None,
-        project_id: str | None = None,
+        project_id: str | list[str] | None = None,
         source_harness: str | None = None,
         include_archived: bool = True,
         reranker: Any | None = None,
         rerank_top_k: int = 20,
     ) -> list[SearchResult]:
-        """Hybrid search combining FTS5 BM25 + USearch cosine similarity via RRF(k=60) * tier * recency (+ optional rerank)."""
+        """Hybrid search combining FTS5 BM25 + USearch cosine similarity via RRF(k=20) * tier * recency (+ optional rerank)."""
         if limit <= 0:
             return []
 
-        fts_expr, tokens = sanitize_fts5_query(query)
+        strict_expr, broad_expr, tokens, phrases = build_fts5_queries(query)
         q_vec = _normalize_vector(np.asarray(query_vec, dtype=np.float32)) if query_vec is not None else None
         if q_vec is not None and (q_vec.size == 0 or float(np.linalg.norm(q_vec)) == 0.0):
             q_vec = None
 
-        if fts_expr is None and q_vec is None:
+        if broad_expr is None and q_vec is None:
             return []
 
         media_val = media_type.value if isinstance(media_type, MediaType) else media_type
@@ -1650,8 +2008,10 @@ class ChittamStore:
         candidate_k = max(limit * 8, rerank_top_k if reranker is not None else limit, 64)
         pool_limit = max(limit, rerank_top_k) if reranker is not None else limit
         candidates = self._run_hybrid_search(
-            fts_expr=fts_expr,
+            fts_expr=broad_expr,
+            strict_fts_expr=strict_expr,
             tokens=tokens,
+            phrases=phrases,
             q_vec=q_vec,
             limit=pool_limit,
             candidate_k=candidate_k,
@@ -1691,7 +2051,7 @@ class ChittamStore:
         else:
             harnesses = list(_DEFAULT_THREAD_HARNESSES)
 
-        fts_expr, tokens = sanitize_fts5_query(query)
+        strict_expr, broad_expr, tokens, phrases = build_fts5_queries(query)
         q_vec = _normalize_vector(np.asarray(query_vec, dtype=np.float32)) if query_vec is not None else None
         if q_vec is not None and (q_vec.size == 0 or float(np.linalg.norm(q_vec)) == 0.0):
             q_vec = None
@@ -1704,7 +2064,7 @@ class ChittamStore:
             scope_sql = f"(d.media_type = ? OR d.source_harness IN ({placeholders}))"
             scope_params = [MediaType.TRANSCRIPT.value, *harnesses]
 
-        if fts_expr is None and q_vec is None:
+        if broad_expr is None and q_vec is None:
             with self._lock:
                 rows = self.conn.execute(
                     f"""
@@ -1726,7 +2086,9 @@ class ChittamStore:
                 if row["doc_id"] in seen_docs:
                     continue
                 seen_docs.add(row["doc_id"])
-                score = _tier_weight(row["canonical_tier"]) * _recency_multiplier(row["updated_at"], now)
+                doc_meta = json.loads(row["metadata_json"] or "{}")
+                sub_w = 0.75 if doc_meta.get("is_subagent") else 1.0
+                score = _tier_weight(row["canonical_tier"]) * _recency_multiplier(row["updated_at"], now) * sub_w
                 recent_results.append(
                     SearchResult(
                         chunk_id=row["chunk_id"],
@@ -1743,7 +2105,7 @@ class ChittamStore:
                         snippet=_make_snippet(row["content"], []),
                         l0_summary=row["l0_summary"],
                         updated_at=row["updated_at"],
-                        metadata=json.loads(row["metadata_json"] or "{}"),
+                        metadata=doc_meta,
                     )
                 )
                 if len(recent_results) >= limit:
@@ -1754,8 +2116,10 @@ class ChittamStore:
         params: list[Any] = list(scope_params)
         pool_limit = max(limit * 4, rerank_top_k * 2 if reranker is not None else limit * 4)
         raw_results = self._run_hybrid_search(
-            fts_expr=fts_expr,
+            fts_expr=broad_expr,
+            strict_fts_expr=strict_expr,
             tokens=tokens,
+            phrases=phrases,
             q_vec=q_vec,
             limit=pool_limit,
             candidate_k=max(limit * 10, rerank_top_k * 2 if reranker is not None else limit * 10, 64),
@@ -1764,6 +2128,7 @@ class ChittamStore:
             include_decisions=False,
             project_id=None,
             include_archived=True,
+            min_vector_hits=min(limit, 8),
         )
         deduped: list[SearchResult] = []
         seen_doc_ids: set[str] = set()
@@ -1839,13 +2204,19 @@ class ChittamStore:
 
     def list_decisions(
         self,
-        project_id: str | None = None,
+        project_id: str | list[str] | None = None,
         active_only: bool = True,
     ) -> list[DecisionRecord]:
-        """List recorded decisions, optionally scoped to project_id and active-only."""
+        """List recorded decisions, optionally scoped to project_id(s) and active-only."""
         clauses: list[str] = []
         params: list[Any] = []
-        if project_id is not None:
+        if isinstance(project_id, (list, tuple)):
+            clean_pids = [str(p) for p in project_id if p]
+            if clean_pids:
+                ph = ", ".join("?" for _ in clean_pids)
+                clauses.append(f"project_id IN ({ph})")
+                params.extend(clean_pids)
+        elif project_id is not None:
             clauses.append("project_id = ?")
             params.append(project_id)
         if active_only:
@@ -1930,7 +2301,7 @@ class ChittamStore:
     def _build_filter_sql(
         self,
         media_type: str | None,
-        project_id: str | None,
+        project_id: str | list[str] | None,
         source_harnesses: list[str] | None,
         include_archived: bool,
     ) -> tuple[list[str], list[Any]]:
@@ -1939,7 +2310,16 @@ class ChittamStore:
         if media_type:
             clauses.append("d.media_type = ?")
             params.append(media_type)
-        if project_id:
+        if isinstance(project_id, (list, tuple)):
+            clean_pids = [str(p) for p in project_id if p]
+            if len(clean_pids) == 1:
+                clauses.append("d.project_id = ?")
+                params.append(clean_pids[0])
+            elif clean_pids:
+                ph = ", ".join("?" for _ in clean_pids)
+                clauses.append(f"d.project_id IN ({ph})")
+                params.extend(clean_pids)
+        elif project_id:
             clauses.append("d.project_id = ?")
             params.append(project_id)
         if source_harnesses:
@@ -2005,9 +2385,12 @@ class ChittamStore:
         where_clauses: list[str],
         params: list[Any],
         include_decisions: bool,
-        project_id: str | None,
+        project_id: str | list[str] | None,
         include_archived: bool,
         explicit_decision_filter: bool = False,
+        strict_fts_expr: str | None = None,
+        phrases: list[str] | None = None,
+        min_vector_hits: int | None = None,
     ) -> list[SearchResult]:
         bm25_ranks: dict[str, int] = {}
         vector_ranks: dict[str, int] = {}
@@ -2017,30 +2400,48 @@ class ChittamStore:
 
         with self._lock:
             if fts_expr:
-                try:
-                    fts_rows = self.conn.execute(
-                        f"""
-                        SELECT chunks_fts.chunk_id AS chunk_id,
-                               bm25(chunks_fts, 0.0, 0.0, 2.0, 1.0, 3.0, 2.0, 0.5) AS bm25_score
-                        FROM chunks_fts
-                        JOIN chunks c ON c.chunk_id = chunks_fts.chunk_id
-                        JOIN documents d ON d.doc_id = c.doc_id
-                        WHERE chunks_fts MATCH ? {filter_sql}
-                        ORDER BY bm25_score ASC
-                        LIMIT ?
-                        """,
-                        (fts_expr, *params, candidate_k),
-                    ).fetchall()
-                    for idx, row in enumerate(fts_rows, start=1):
-                        bm25_ranks[row["chunk_id"]] = idx
-                except sqlite3.OperationalError:
-                    pass
+                fts_sql = f"""
+                    SELECT chunks_fts.chunk_id AS chunk_id,
+                           bm25(chunks_fts, 0.0, 0.0, 2.0, 1.0, 3.0, 2.0, 0.5) AS bm25_score
+                    FROM chunks_fts
+                    JOIN chunks c ON c.chunk_id = chunks_fts.chunk_id
+                    JOIN documents d ON d.doc_id = c.doc_id
+                    WHERE chunks_fts MATCH ? {filter_sql}
+                    ORDER BY bm25_score ASC
+                    LIMIT ?
+                """
+                if strict_fts_expr and strict_fts_expr != fts_expr:
+                    try:
+                        strict_rows = self.conn.execute(
+                            fts_sql,
+                            (strict_fts_expr, *params, candidate_k),
+                        ).fetchall()
+                        for row in strict_rows:
+                            cid = row["chunk_id"]
+                            if cid not in bm25_ranks:
+                                bm25_ranks[cid] = len(bm25_ranks) + 1
+                    except sqlite3.OperationalError:
+                        pass
+                if len(bm25_ranks) < candidate_k:
+                    try:
+                        fts_rows = self.conn.execute(
+                            fts_sql,
+                            (fts_expr, *params, candidate_k),
+                        ).fetchall()
+                        for row in fts_rows:
+                            cid = row["chunk_id"]
+                            if cid not in bm25_ranks:
+                                bm25_ranks[cid] = len(bm25_ranks) + 1
+                    except sqlite3.OperationalError:
+                        pass
 
             if q_vec is not None:
                 dim = int(q_vec.shape[0])
                 vec_idx = self._get_vec_index_for_search(expected_dim=dim)
                 if vec_idx is not None and vec_idx.count() > 0:
-                    oversample_k = min(max(candidate_k * 6, 256), vec_idx.count())
+                    oversample_mult = 12 if where_clauses else 6
+                    oversample_floor = 1024 if where_clauses else 256
+                    oversample_k = min(max(candidate_k * oversample_mult, oversample_floor), vec_idx.count())
                     vec_hits = vec_idx.search(q_vec, oversample_k)
                     if vec_hits:
                         hit_keys = [k for k, _ in vec_hits]
@@ -2089,8 +2490,9 @@ class ChittamStore:
                             for rank_idx, cid in enumerate(filtered_cids[:candidate_k], start=1):
                                 vector_ranks[cid] = rank_idx
 
-                    # Narrow-filter fallback when a tight filter (e.g. image/project) gets < limit hits from HNSW
-                    if where_clauses and len(vector_ranks) < limit:
+                    # Narrow-filter fallback when a tight filter (e.g. image/project) gets fewer hits from HNSW
+                    fallback_min = min_vector_hits if min_vector_hits is not None else limit
+                    if where_clauses and len(vector_ranks) < fallback_min:
                         vector_ranks = self._run_vector_fallback_filtered_chunks_unlocked(
                             q_vec=q_vec,
                             dim=dim,
@@ -2141,10 +2543,6 @@ class ChittamStore:
             if v_rank is not None:
                 rrf += 1.0 / (_RRF_K + v_rank)
 
-            tier_w = _tier_weight(row["canonical_tier"])
-            rec_w = _recency_multiplier(row["updated_at"], now)
-            final_score = rrf * tier_w * rec_w
-
             doc_meta = json.loads(row["doc_meta_json"] or "{}")
             chunk_meta = json.loads(row["chunk_meta_json"] or "{}")
             merged_meta = {**doc_meta, **chunk_meta}
@@ -2154,6 +2552,11 @@ class ChittamStore:
                 merged_meta.setdefault("line_start", row["line_start"])
             if row["line_end"] is not None:
                 merged_meta.setdefault("line_end", row["line_end"])
+
+            tier_w = _tier_weight(row["canonical_tier"])
+            rec_w = _recency_multiplier(row["updated_at"], now)
+            sub_w = 0.75 if doc_meta.get("is_subagent") else 1.0
+            final_score = rrf * tier_w * rec_w * sub_w
 
             results.append(
                 SearchResult(
@@ -2184,10 +2587,11 @@ class ChittamStore:
         results = list(best_by_doc.values())
         has_chunk_results = bool(results)
 
-        if include_decisions and (tokens or q_vec is not None or decision_vector_ranks):
+        if include_decisions and (tokens or phrases or q_vec is not None or decision_vector_ranks):
             results.extend(
                 self._search_decisions(
                     tokens=tokens,
+                    phrases=phrases or [],
                     q_vec=q_vec,
                     decision_vector_ranks=decision_vector_ranks,
                     project_id=project_id,
@@ -2206,10 +2610,11 @@ class ChittamStore:
         tokens: list[str],
         q_vec: np.ndarray | None,
         decision_vector_ranks: dict[str, int],
-        project_id: str | None,
+        project_id: str | list[str] | None,
         include_archived: bool,
         now: datetime,
         *,
+        phrases: list[str] | tuple[str, ...] = (),
         explicit_decision_filter: bool = False,
         has_chunk_results: bool = True,
     ) -> list[SearchResult]:
@@ -2219,16 +2624,38 @@ class ChittamStore:
 
         by_id = {d.decision_id: d for d in decisions}
 
-        # Lexical ranks
+        # Lexical ranks using word boundaries, stopword filtering, and phrase matching
         lex_ranks: dict[str, int] = {}
-        if tokens:
-            lowered_tokens = [t.lower() for t in tokens]
+        lex_hits: dict[str, int] = {}
+        phrase_list = [p.strip().lower() for p in phrases if p and p.strip()]
+        phrase_word_set = {w for p in phrase_list for w in p.split()}
+        raw_non_stop = [t.lower() for t in tokens if t and t.lower() not in _STOPWORDS]
+        non_phrase_tokens = [t for t in raw_non_stop if t not in phrase_word_set]
+        if not phrase_list and not non_phrase_tokens:
+            non_phrase_tokens = [t.lower() for t in tokens if t]
+
+        total_terms = len(phrase_list) + len(non_phrase_tokens)
+        if total_terms > 0:
+            phrase_patterns = [
+                re.compile(
+                    r"(?<!\w)" + r"[-_\s/]+".join(re.escape(w) for w in ph.split()) + r"(?!\w)",
+                    re.IGNORECASE,
+                )
+                for ph in phrase_list
+                if ph.split()
+            ]
+            token_patterns = [
+                re.compile(rf"(?<!\w){re.escape(tok)}(?!\w)", re.IGNORECASE)
+                for tok in non_phrase_tokens
+            ]
             scored_lex: list[tuple[int, DecisionRecord]] = []
             for dec in decisions:
-                hay = f"{dec.project_id} {dec.topic} {dec.statement}".lower()
-                hits = sum(1 for tok in lowered_tokens if tok in hay)
+                hay = f"{dec.project_id} {dec.topic} {dec.statement}"
+                hits = sum(2 for pat in phrase_patterns if pat.search(hay))
+                hits += sum(1 for pat in token_patterns if pat.search(hay))
                 if hits > 0:
                     scored_lex.append((hits, dec))
+                    lex_hits[dec.decision_id] = hits
             scored_lex.sort(key=lambda pair: (pair[0], pair[1].created_at), reverse=True)
             for rank, (_, dec) in enumerate(scored_lex, start=1):
                 lex_ranks[dec.decision_id] = rank
@@ -2270,12 +2697,20 @@ class ChittamStore:
 
         matched_ids = list(dict.fromkeys([*lex_ranks.keys(), *vec_ranks.keys()]))
         out: list[SearchResult] = []
+        max_possible_hits = max(1, len(phrase_list) * 2 + len(non_phrase_tokens))
         for did in matched_ids:
             dec = by_id.get(did)
             if dec is None:
                 continue
             l_rank = lex_ranks.get(did)
             v_rank = vec_ranks.get(did)
+            hit_score = lex_hits.get(did, 0)
+            coverage = min(1.0, hit_score / max_possible_hits)
+
+            if not explicit_decision_filter and has_chunk_results and v_rank is None:
+                if total_terms > 1 and (hit_score < 2 or coverage < 0.4):
+                    continue
+
             rrf = 0.0
             if l_rank is not None:
                 rrf += 1.0 / (_RRF_K + l_rank)
@@ -2283,6 +2718,9 @@ class ChittamStore:
                 rrf += 1.0 / (_RRF_K + v_rank)
             if rrf <= 0.0:
                 continue
+
+            if not explicit_decision_filter and has_chunk_results and q_vec is not None and v_rank is None:
+                rrf *= 0.35 + 0.65 * coverage
 
             tier = RepoTier.ACTIVE if dec.valid_to is None else RepoTier.ARCHIVE
             score = rrf * TIER_WEIGHTS[tier] * _recency_multiplier(dec.created_at, now)

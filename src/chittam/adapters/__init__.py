@@ -452,6 +452,9 @@ def collect_all_documents(
     image_cache_lookup: Callable[[str], str | None] | None = None,
     existing_stats: dict[str, tuple[int | None, int | None, str, str, str]] | None = None,
     unchanged_doc_ids: set[str] | None = None,
+    existing_projects: dict[str, str | None] | None = None,
+    unreadable_prefixes: set[str] | None = None,
+    failed_harnesses: set[str] | None = None,
 ) -> tuple[list[DocumentRecord], SyncStats]:
     """Collect normalized DocumentRecords across all harness and filesystem adapters."""
     stats = SyncStats()
@@ -463,6 +466,8 @@ def collect_all_documents(
             loaded = fn()
         except Exception as exc:
             stats.errors.append(f"{name}: {exc}")
+            if failed_harnesses is not None:
+                failed_harnesses.add(name)
             return
         for doc in loaded:
             if doc.media_type in enabled:
@@ -481,6 +486,8 @@ def collect_all_documents(
             stats=stats,
             existing_stats=existing_stats,
             unchanged_doc_ids=unchanged_doc_ids,
+            existing_projects=existing_projects,
+            unreadable_prefixes=unreadable_prefixes,
         ),
     )
 

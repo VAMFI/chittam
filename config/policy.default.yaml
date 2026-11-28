@@ -102,6 +102,7 @@ local_provider:
   rerank_model: null
   rerank_top_k: 20
   timeout_seconds: 90.0
+  keep_alive: 30m
 
 external_provider:
   enabled: false
@@ -126,3 +127,6 @@ harnesses:
 enable_leann_bridge: true
 enable_codegraph: true
 vector_backend: usearch
+atlas_refresh_hours: 12.0
+auto_compact_freelist_ratio: 0.15
+auto_compact_orphan_threshold: 5000

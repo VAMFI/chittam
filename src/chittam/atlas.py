@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -472,17 +473,103 @@ def match_repo_for_path(path: Path | str | None, atlas: dict[str, CanonicalRepo]
     return RepoPathIndex(atlas).match(path, resolve_path=True)
 
 
-def match_repo_from_text(text: str, atlas: dict[str, CanonicalRepo]) -> CanonicalRepo | None:
+_BOUNDARY_AFTER_PATH = frozenset("/ \t\r\n\"'`),:;]>")
+
+
+def is_atlas_stale(path: Path, max_age_hours: float) -> bool:
+    """Return True if the atlas YAML is missing or older than `max_age_hours`."""
+    if not path.exists():
+        return True
+    if max_age_hours <= 0:
+        return False
+    try:
+        age_sec = time.time() - path.stat().st_mtime
+    except OSError:
+        return True
+    return age_sec > float(max_age_hours) * 3600.0
+
+
+def resolve_project_filter(
+    project_id: str | None,
+    atlas: dict[str, CanonicalRepo],
+) -> list[str] | None:
+    """Resolve an exact project_id or atlas family/name into matching project_ids."""
+    if not project_id or not project_id.strip():
+        return None
+    raw = project_id.strip()
+    if raw in atlas:
+        return [raw]
+    low = raw.lower()
+    matches: list[str] = []
+    for pid, repo in atlas.items():
+        if (
+            pid.lower() == low
+            or repo.family.lower() == low
+            or repo.name.lower() == low
+            or pid.lower().startswith(low + "-")
+        ):
+            matches.append(pid)
+    if not matches:
+        return [raw]
+    if raw not in matches:
+        matches.append(raw)
+    return list(dict.fromkeys(matches))
+
+
+def _count_path_mentions(haystack: str, needle: str) -> int:
+    """Count occurrences of `needle` with a path/token boundary after it."""
+    if not haystack or not needle:
+        return 0
+    count = 0
+    start = 0
+    n_len = len(needle)
+    h_len = len(haystack)
+    while True:
+        idx = haystack.find(needle, start)
+        if idx == -1:
+            break
+        after_idx = idx + n_len
+        if after_idx >= h_len or haystack[after_idx] in _BOUNDARY_AFTER_PATH:
+            count += 1
+        start = idx + 1
+    return count
+
+
+def match_repo_from_text(
+    text: str,
+    atlas: dict[str, CanonicalRepo],
+    *,
+    early_text: str | None = None,
+) -> CanonicalRepo | None:
     """Best-effort match of a git repo path mentioned in transcript or artifact text."""
     if not text or not atlas:
         return None
-    best_repo: CanonicalRepo | None = None
-    best_len = -1
+    early = early_text if early_text is not None else text[:4000]
+    candidates: list[tuple[tuple[int, int, int], CanonicalRepo]] = []
     for repo in atlas.values():
         repo_path = repo.path.rstrip("/")
-        if len(repo_path) <= 4:
+        if len(repo_path) <= 4 or repo_path not in text:
             continue
-        if repo_path in text and len(repo_path) > best_len:
-            best_len = len(repo_path)
-            best_repo = repo
+        total_hits = _count_path_mentions(text, repo_path)
+        if total_hits <= 0:
+            continue
+        early_hits = _count_path_mentions(early, repo_path) if early else 0
+        weighted = total_hits + 2 * early_hits
+        active_pref = 1 if repo.tier == RepoTier.ACTIVE else 0
+        candidates.append(((weighted, active_pref, len(repo_path)), repo))
+
+    if not candidates:
+        return None
+
+    non_archive = [c for c in candidates if c[1].tier != RepoTier.ARCHIVE]
+    pool = non_archive if non_archive else candidates
+    pool.sort(key=lambda item: item[0], reverse=True)
+    best_score, best_repo = pool[0]
+
+    # Guard against demoting a long general/multi-project transcript to ARCHIVE on a single stray mention.
+    if best_repo.tier == RepoTier.ARCHIVE and len(text) > 5000:
+        total_mentions = _count_path_mentions(text, best_repo.path.rstrip("/"))
+        if total_mentions < 2:
+            return None
+    _ = best_score
     return best_repo

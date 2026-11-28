@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import typer
 
-from chittam.atlas import build_or_load_atlas, save_atlas
+from chittam.atlas import build_or_load_atlas, resolve_project_filter, save_atlas
 from chittam.config import load_config, save_default_user_config
 from chittam.indexer import build_leann_export, sync_memory
 from chittam.models import AppConfig, RepoTier, SyncStats
@@ -168,6 +168,10 @@ def search_cmd(
             except ImportError:
                 typer.echo("flashrank is not installed; install with `uv sync --extra rerank`.", err=True)
 
+    resolved_project: str | list[str] | None = project_id
+    if project_id and cfg.atlas_path.exists():
+        resolved_project = resolve_project_filter(project_id, build_or_load_atlas(cfg, refresh=False))
+
     with ChittamStore(cfg) as store:
         q_vec: np.ndarray | None = None
         if not no_vector and store.has_embeddings():
@@ -182,7 +186,7 @@ def search_cmd(
             query_vec=q_vec,
             limit=limit,
             media_type=media_type,
-            project_id=project_id,
+            project_id=resolved_project,
             source_harness=harness,
             include_archived=include_archived,
             reranker=reranker,

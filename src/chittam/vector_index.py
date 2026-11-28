@@ -219,7 +219,7 @@ class USearchVectorIndex:
                     self._index.remove(key_arr[present_mask], compact=False)
             self._index.add(key_arr, encoded)
 
-    def remove(self, keys: list[int] | np.ndarray) -> None:
+    def remove(self, keys: list[int] | np.ndarray, *, compact: bool = False) -> None:
         key_arr = np.asarray(keys, dtype=np.uint64).reshape(-1)
         if key_arr.size == 0:
             return
@@ -228,7 +228,7 @@ class USearchVectorIndex:
                 return
             present_mask = np.asarray(self._index.contains(key_arr), dtype=bool).reshape(-1)
             if np.any(present_mask):
-                self._index.remove(key_arr[present_mask], compact=True)
+                self._index.remove(key_arr[present_mask], compact=compact)
 
     def search(self, query_vec: np.ndarray, k: int) -> list[tuple[int, float]]:
         if k <= 0:

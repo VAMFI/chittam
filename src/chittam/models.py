@@ -163,6 +163,7 @@ class LocalProviderConfig(BaseModel):
     rerank_model: str | None = None
     rerank_top_k: int = 20
     timeout_seconds: float = 90.0
+    keep_alive: str = "30m"
 
 
 class ExternalProviderConfig(BaseModel):
@@ -185,6 +186,7 @@ class HarnessesConfig(BaseModel):
     codex_config_path: str = "~/.codex/config.toml"
     claude_config_path: str = "~/.claude.json"
     antigravity_rules_path: str = "~/.gemini/GEMINI.md"
+    antigravity_rules_dir: str = "~/.gemini/config/rules"
     claude_rules_path: str = "~/.claude/CLAUDE.md"
     codex_rules_path: str = "~/.codex/AGENTS.md"
     antigravity_brain_dir: str = "~/.gemini/antigravity/brain"
@@ -206,6 +208,9 @@ class AppConfig(BaseModel):
     enable_leann_bridge: bool = True
     enable_codegraph: bool = True
     vector_backend: Literal["usearch", "numpy"] = "usearch"
+    atlas_refresh_hours: float = 12.0
+    auto_compact_freelist_ratio: float = 0.15
+    auto_compact_orphan_threshold: int = 5000
 
     @property
     def db_path(self) -> Path:

@@ -100,9 +100,19 @@ def remove_managed_block(existing_text: str) -> tuple[str, bool]:
     return result, True
 
 
+def _resolve_antigravity_rules_target(cfg: AppConfig) -> Path:
+    """Resolve Antigravity rules target, preferring Antigravity 2.0 rules dir when GEMINI.md is absent."""
+    ag_path = Path(cfg.harnesses.antigravity_rules_path).expanduser()
+    if cfg.harnesses.antigravity_rules_path == "~/.gemini/GEMINI.md" and not ag_path.exists():
+        ag_rules_dir = Path(cfg.harnesses.antigravity_rules_dir).expanduser()
+        if ag_rules_dir.is_dir():
+            return ag_rules_dir / "chittam.md"
+    return ag_path
+
+
 def _resolve_rule_targets(cfg: AppConfig, extra_files: list[Path] | None) -> list[tuple[str, Path]]:
     targets: list[tuple[str, Path]] = [
-        ("antigravity", Path(cfg.harnesses.antigravity_rules_path).expanduser()),
+        ("antigravity", _resolve_antigravity_rules_target(cfg)),
         ("claude_code", Path(cfg.harnesses.claude_rules_path).expanduser()),
         ("codex", Path(cfg.harnesses.codex_rules_path).expanduser()),
     ]
@@ -199,6 +209,15 @@ def uninstall_rules(
             continue
 
         backup = _create_backup(target, cfg.backup_dir, f"rules_uninstall_{ts}")
+        ag_rules_dir = Path(cfg.harnesses.antigravity_rules_dir).expanduser().resolve(strict=False)
+        if not after.strip() and target.name == "chittam.md" and target.parent.resolve(strict=False) == ag_rules_dir:
+            target.unlink(missing_ok=True)
+            targets_summary[label] = {
+                "status": "removed",
+                "path": str(target),
+                "backup": str(backup),
+            }
+            continue
         _atomic_write_text(target, after, mode=original_mode)
         targets_summary[label] = {
             "status": "removed",

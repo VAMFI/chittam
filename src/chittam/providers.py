@@ -193,6 +193,7 @@ class OllamaEmbeddingProvider:
         matryoshka_dim: int | None = None,
         timeout_seconds: float | None = None,
         batch_size: int = 32,
+        keep_alive: str | None = None,
         client: httpx.Client | None = None,
     ) -> None:
         if isinstance(config, AppConfig):
@@ -215,6 +216,7 @@ class OllamaEmbeddingProvider:
             timeout_seconds if timeout_seconds is not None else local_cfg.timeout_seconds
         )
         self.batch_size = max(1, batch_size)
+        self.keep_alive = keep_alive if keep_alive is not None else local_cfg.keep_alive
         self._client = client
 
     @property
@@ -229,7 +231,10 @@ class OllamaEmbeddingProvider:
             return client.post(url, json=payload)
 
     def _embed_batch(self, batch: list[str]) -> list[list[float]]:
-        resp = self._post_json("/api/embed", {"model": self.model_name, "input": batch})
+        payload: dict[str, Any] = {"model": self.model_name, "input": batch}
+        if self.keep_alive:
+            payload["keep_alive"] = self.keep_alive
+        resp = self._post_json("/api/embed", payload)
         if resp.status_code in (404, 405, 501):
             return self._embed_legacy_batch(batch)
         resp.raise_for_status()

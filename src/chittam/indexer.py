@@ -15,11 +15,12 @@ from typing import Any, Callable
 import numpy as np
 
 from chittam.adapters import collect_all_documents, load_antigravity_docs, load_claude_code_docs, load_codex_docs, load_single_file_doc
-from chittam.atlas import build_or_load_atlas, save_atlas
+from chittam.adapters.files import UNREADABLE_IMAGE_SENTINEL
+from chittam.atlas import build_or_load_atlas, is_atlas_stale, save_atlas
 from chittam.config import redact_secrets
 from chittam.models import AppConfig, ChunkRecord, MediaType, RepoTier, SyncStats
 from chittam.providers import build_embedding_provider, build_vision_provider
-from chittam.store import ChittamStore, decision_embedding_text
+from chittam.store import ChittamStore, decision_embedding_text, file_lock
 
 _EMBED_BATCH_SIZE = 32
 _LEANN_DEFAULT_THRESHOLD = 500
@@ -161,6 +162,8 @@ def _build_vision_helper(
         def _cached_vision(image_path: Path, context_hint: str = "") -> str:
             sha = _sha256_file(image_path)
             cached = store.get_cached_image_caption(sha)
+            if cached == UNREADABLE_IMAGE_SENTINEL:
+                return ""
             if cached is not None:
                 return cached
             raw = vp.describe_image(image_path, context_hint=context_hint)
@@ -175,6 +178,8 @@ def _build_vision_helper(
             if caption:
                 caption = redact_secrets(caption)
                 store.cache_image_caption(sha, vision_model_name, caption)
+            else:
+                store.cache_image_caption(sha, vision_model_name, UNREADABLE_IMAGE_SENTINEL)
             return caption
 
         return _cached_vision, vision_model_name
@@ -323,31 +328,22 @@ def sync_memory(
     Path(cfg.config_dir).expanduser().mkdir(parents=True, exist_ok=True)
 
     lock_path = Path(cfg.data_dir).expanduser() / "sync.lock"
-    lock_fh = lock_path.open("w", encoding="utf-8")
     try:
-        try:
-            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            stats.errors.append("sync_already_in_progress")
-            stats.duration_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-            return stats
-
-        return _sync_memory_locked(
-            cfg=cfg,
-            stats=stats,
-            t0=t0,
-            refresh_atlas=refresh_atlas,
-            use_external=use_external,
-            skip_embeddings=skip_embeddings,
-            skip_vision=skip_vision,
-            progress_cb=progress_cb,
-        )
-    finally:
-        try:
-            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
-        except OSError:
-            pass
-        lock_fh.close()
+        with file_lock(lock_path, blocking=False):
+            return _sync_memory_locked(
+                cfg=cfg,
+                stats=stats,
+                t0=t0,
+                refresh_atlas=refresh_atlas,
+                use_external=use_external,
+                skip_embeddings=skip_embeddings,
+                skip_vision=skip_vision,
+                progress_cb=progress_cb,
+            )
+    except BlockingIOError:
+        stats.errors.append("sync_already_in_progress")
+        stats.duration_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        return stats
 
 
 def _sync_memory_locked(
@@ -362,7 +358,10 @@ def _sync_memory_locked(
     progress_cb: Callable[..., Any] | None,
 ) -> SyncStats:
     _emit_progress(progress_cb, "atlas", "Loading canonical project atlas")
-    atlas = build_or_load_atlas(cfg, refresh=refresh_atlas)
+    effective_refresh = refresh_atlas or (
+        cfg.atlas_refresh_hours > 0 and is_atlas_stale(cfg.atlas_path, cfg.atlas_refresh_hours)
+    )
+    atlas = build_or_load_atlas(cfg, refresh=effective_refresh)
     if not cfg.atlas_path.exists() and atlas:
         save_atlas(atlas, cfg.atlas_path)
 
@@ -377,7 +376,10 @@ def _sync_memory_locked(
 
         _emit_progress(progress_cb, "collect", "Collecting documents across harnesses and roots")
         existing_stats = store.get_document_stat_index()
+        existing_projects = store.get_document_projects()
         unchanged_doc_ids: set[str] = set()
+        unreadable_prefixes: set[str] = set()
+        failed_harnesses: set[str] = set()
 
         sig = inspect.signature(collect_all_documents)
         collect_kwargs: dict[str, Any] = {
@@ -388,6 +390,12 @@ def _sync_memory_locked(
             collect_kwargs["existing_stats"] = existing_stats
         if "unchanged_doc_ids" in sig.parameters:
             collect_kwargs["unchanged_doc_ids"] = unchanged_doc_ids
+        if "existing_projects" in sig.parameters:
+            collect_kwargs["existing_projects"] = existing_projects
+        if "unreadable_prefixes" in sig.parameters:
+            collect_kwargs["unreadable_prefixes"] = unreadable_prefixes
+        if "failed_harnesses" in sig.parameters:
+            collect_kwargs["failed_harnesses"] = failed_harnesses
 
         docs, collect_stats = collect_all_documents(cfg, atlas, **collect_kwargs)
 
@@ -427,15 +435,26 @@ def _sync_memory_locked(
             existing = existing_stats.get(doc.doc_id)
             if existing is not None:
                 ex_mtime, ex_size, ex_sha, ex_tier, ex_l0 = existing
-                if ex_sha == doc.sha256 and ex_tier == doc_tier:
+                if ex_sha == doc.sha256:
                     if doc.media_type != MediaType.IMAGE or ex_l0 == doc.l0_summary:
-                        if (ex_mtime is None or ex_size is None) and doc.metadata.get("file_mtime_ns") is not None:
-                            store.update_document_file_stat(
-                                doc.doc_id,
-                                doc.metadata.get("file_mtime_ns"),
-                                doc.metadata.get("file_size"),
-                            )
-                        stats.skipped_unchanged += 1
+                        ex_proj = existing_projects.get(doc.doc_id)
+                        if ex_tier == doc_tier and ex_proj == doc.project_id:
+                            if (ex_mtime is None or ex_size is None) and doc.metadata.get("file_mtime_ns") is not None:
+                                store.update_document_file_stat(
+                                    doc.doc_id,
+                                    doc.metadata.get("file_mtime_ns"),
+                                    doc.metadata.get("file_size"),
+                                )
+                            stats.skipped_unchanged += 1
+                            continue
+                        store.update_document_metadata(
+                            doc.doc_id,
+                            project_id=doc.project_id,
+                            canonical_tier=doc_tier,
+                            file_mtime_ns=doc.metadata.get("file_mtime_ns"),
+                            file_size=doc.metadata.get("file_size"),
+                        )
+                        stats.indexed_docs += 1
                         continue
 
             store.upsert_document(doc, _save_vec=False)
@@ -445,11 +464,13 @@ def _sync_memory_locked(
         store.flush_vector_index()
         stats.scanned_docs = len(docs) + len(unchanged_doc_ids)
 
-        # Prune docs no longer present unless collection hit a catastrophic empty-output error
+        # Prune docs no longer present, protecting unreadable TCC roots and failed harness adapters
         if docs or unchanged_doc_ids or not collect_stats.errors:
             store.prune_documents(
                 seen_doc_ids,
                 preserve_media_types={MediaType.DECISION.value},
+                preserve_uri_prefixes=unreadable_prefixes,
+                preserve_harnesses=failed_harnesses,
             )
 
         if not skip_embeddings:
@@ -461,6 +482,16 @@ def _sync_memory_locked(
                 chunk_limit=cfg.privacy.max_embed_chunks_per_sync,
                 progress_cb=progress_cb,
             )
+
+        if store.needs_compaction(
+            freelist_ratio=cfg.auto_compact_freelist_ratio,
+            orphan_threshold=cfg.auto_compact_orphan_threshold,
+        ):
+            _emit_progress(progress_cb, "compact", "Compacting SQLite and USearch index")
+            try:
+                store.compact()
+            except Exception as exc:
+                stats.errors.append(f"auto_compact_error: {exc}")
 
         if cfg.enable_leann_bridge and stats.indexed_docs > 0:
             try:
@@ -504,102 +535,128 @@ def sync_changed_paths(
     Path(cfg.data_dir).expanduser().mkdir(parents=True, exist_ok=True)
     Path(cfg.config_dir).expanduser().mkdir(parents=True, exist_ok=True)
     lock_path = Path(cfg.data_dir).expanduser() / "sync.lock"
-    lock_fh = lock_path.open("w", encoding="utf-8")
     try:
-        try:
-            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            stats.errors.append("sync_already_in_progress")
-            stats.duration_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-            return stats
+        with file_lock(lock_path, blocking=False):
+            return _sync_changed_paths_locked(
+                cfg=cfg,
+                paths=paths,
+                stats=stats,
+                t0=t0,
+                skip_embeddings=skip_embeddings,
+                skip_vision=skip_vision,
+            )
+    except BlockingIOError:
+        stats.errors.append("sync_already_in_progress")
+        stats.duration_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        return stats
 
-        atlas = build_or_load_atlas(cfg, refresh=False)
-        ag_dir = Path(cfg.harnesses.antigravity_brain_dir).expanduser()
-        codex_dir = Path(cfg.harnesses.codex_home_dir).expanduser()
-        claude_proj_dir = Path(cfg.harnesses.claude_projects_dir).expanduser()
-        claude_hist_path = Path(cfg.harnesses.claude_history_path).expanduser()
 
-        refresh_ag = False
-        refresh_codex = False
-        refresh_claude = False
-        file_candidates: list[Path] = []
+def _sync_changed_paths_locked(
+    *,
+    cfg: AppConfig,
+    paths: list[Path | str],
+    stats: SyncStats,
+    t0: float,
+    skip_embeddings: bool,
+    skip_vision: bool,
+) -> SyncStats:
+    atlas = build_or_load_atlas(cfg, refresh=False)
+    ag_dir = Path(cfg.harnesses.antigravity_brain_dir).expanduser()
+    codex_dir = Path(cfg.harnesses.codex_home_dir).expanduser()
+    claude_proj_dir = Path(cfg.harnesses.claude_projects_dir).expanduser()
+    claude_hist_path = Path(cfg.harnesses.claude_history_path).expanduser()
 
-        for raw in paths:
-            p = Path(raw).expanduser()
-            if _is_under_dir(p, ag_dir):
-                refresh_ag = True
-            elif _is_under_dir(p, codex_dir):
-                refresh_codex = True
-            elif _is_under_dir(p, claude_proj_dir) or p.resolve(strict=False) == claude_hist_path.resolve(strict=False):
-                refresh_claude = True
-            else:
-                file_candidates.append(p)
+    refresh_ag = False
+    refresh_codex = False
+    refresh_claude = False
+    file_candidates: list[Path] = []
 
-        enabled_media = set(cfg.privacy.enabled_media)
-        with ChittamStore(cfg) as store:
-            existing_stats = store.get_document_stat_index()
-            vision_fn: Callable[[Path, str], str] | None = None
-            if not skip_vision:
-                vision_fn, _ = _build_vision_helper(cfg, store, False, stats)
+    for raw in paths:
+        p = Path(raw).expanduser()
+        if _is_under_dir(p, ag_dir):
+            refresh_ag = True
+        elif _is_under_dir(p, codex_dir):
+            refresh_codex = True
+        elif _is_under_dir(p, claude_proj_dir) or p.resolve(strict=False) == claude_hist_path.resolve(strict=False):
+            refresh_claude = True
+        else:
+            file_candidates.append(p)
 
-            harness_docs: list[Any] = []
-            if refresh_ag:
-                harness_docs.extend(load_antigravity_docs(cfg, atlas))
-            if refresh_codex:
-                harness_docs.extend(load_codex_docs(cfg, atlas))
-            if refresh_claude:
-                harness_docs.extend(load_claude_code_docs(cfg, atlas))
+    enabled_media = set(cfg.privacy.enabled_media)
+    with ChittamStore(cfg) as store:
+        existing_stats = store.get_document_stat_index()
+        existing_projects = store.get_document_projects()
+        vision_fn: Callable[[Path, str], str] | None = None
+        if not skip_vision:
+            vision_fn, _ = _build_vision_helper(cfg, store, False, stats)
 
-            for doc in harness_docs:
-                if doc.media_type not in enabled_media:
-                    continue
-                stats.scanned_docs += 1
-                doc_tier = (
-                    doc.canonical_tier.value
-                    if isinstance(doc.canonical_tier, RepoTier)
-                    else str(doc.canonical_tier)
-                )
-                prev = existing_stats.get(doc.doc_id)
-                if prev is not None and prev[2] == doc.sha256 and prev[3] == doc_tier:
+        harness_docs: list[Any] = []
+        if refresh_ag:
+            harness_docs.extend(load_antigravity_docs(cfg, atlas))
+        if refresh_codex:
+            harness_docs.extend(load_codex_docs(cfg, atlas))
+        if refresh_claude:
+            harness_docs.extend(load_claude_code_docs(cfg, atlas))
+
+        for doc in harness_docs:
+            if doc.media_type not in enabled_media:
+                continue
+            stats.scanned_docs += 1
+            doc_tier = (
+                doc.canonical_tier.value
+                if isinstance(doc.canonical_tier, RepoTier)
+                else str(doc.canonical_tier)
+            )
+            prev = existing_stats.get(doc.doc_id)
+            if prev is not None and prev[2] == doc.sha256:
+                if prev[3] == doc_tier and existing_projects.get(doc.doc_id) == doc.project_id:
                     stats.skipped_unchanged += 1
                     continue
-                store.upsert_document(doc, _save_vec=False)
+                store.update_document_metadata(
+                    doc.doc_id,
+                    project_id=doc.project_id,
+                    canonical_tier=doc_tier,
+                )
                 stats.indexed_docs += 1
-                stats.chunks_written += len(doc.chunks)
+                continue
+            store.upsert_document(doc, _save_vec=False)
+            stats.indexed_docs += 1
+            stats.chunks_written += len(doc.chunks)
 
-            seen_files: set[Path] = set()
-            for p in file_candidates:
-                if p in seen_files:
-                    continue
-                seen_files.add(p)
-                stats.scanned_docs += 1
-                doc, det_id = load_single_file_doc(
-                    p,
-                    cfg,
-                    atlas,
-                    vision_fn=vision_fn,
-                    image_cache_lookup=store.get_cached_image_caption,
-                    stats=stats,
-                )
-                if doc is None:
-                    deleted = False
-                    if det_id:
-                        deleted = store.delete_document(det_id, _save_vec=False) or deleted
-                    for old_id in store.get_doc_ids_by_uri(str(p)):
-                        deleted = store.delete_document(old_id, _save_vec=False) or deleted
-                    continue
+        seen_files: set[Path] = set()
+        for p in file_candidates:
+            if p in seen_files:
+                continue
+            seen_files.add(p)
+            stats.scanned_docs += 1
+            doc, det_id = load_single_file_doc(
+                p,
+                cfg,
+                atlas,
+                vision_fn=vision_fn,
+                image_cache_lookup=store.get_cached_image_caption,
+                stats=stats,
+            )
+            if doc is None:
+                deleted = False
+                if det_id:
+                    deleted = store.delete_document(det_id, _save_vec=False) or deleted
+                for old_id in store.get_doc_ids_by_uri(str(p)):
+                    deleted = store.delete_document(old_id, _save_vec=False) or deleted
+                continue
 
-                if doc.media_type not in enabled_media:
-                    continue
+            if doc.media_type not in enabled_media:
+                continue
 
-                doc_tier = (
-                    doc.canonical_tier.value
-                    if isinstance(doc.canonical_tier, RepoTier)
-                    else str(doc.canonical_tier)
-                )
-                prev = existing_stats.get(doc.doc_id)
-                if prev is not None and prev[2] == doc.sha256 and prev[3] == doc_tier:
-                    if doc.media_type != MediaType.IMAGE or prev[4] == doc.l0_summary:
+            doc_tier = (
+                doc.canonical_tier.value
+                if isinstance(doc.canonical_tier, RepoTier)
+                else str(doc.canonical_tier)
+            )
+            prev = existing_stats.get(doc.doc_id)
+            if prev is not None and prev[2] == doc.sha256:
+                if doc.media_type != MediaType.IMAGE or prev[4] == doc.l0_summary:
+                    if prev[3] == doc_tier and existing_projects.get(doc.doc_id) == doc.project_id:
                         store.update_document_file_stat(
                             doc.doc_id,
                             doc.metadata.get("file_mtime_ns"),
@@ -607,21 +664,24 @@ def sync_changed_paths(
                         )
                         stats.skipped_unchanged += 1
                         continue
+                    store.update_document_metadata(
+                        doc.doc_id,
+                        project_id=doc.project_id,
+                        canonical_tier=doc_tier,
+                        file_mtime_ns=doc.metadata.get("file_mtime_ns"),
+                        file_size=doc.metadata.get("file_size"),
+                    )
+                    stats.indexed_docs += 1
+                    continue
 
-                store.upsert_document(doc, _save_vec=False)
-                stats.indexed_docs += 1
-                stats.chunks_written += len(doc.chunks)
+            store.upsert_document(doc, _save_vec=False)
+            stats.indexed_docs += 1
+            stats.chunks_written += len(doc.chunks)
 
-            store.flush_vector_index()
+        store.flush_vector_index()
 
-            if not skip_embeddings and stats.indexed_docs > 0:
-                _run_embedding_stage(cfg, store, stats, use_external=False, chunk_limit=256)
+        if not skip_embeddings and stats.indexed_docs > 0:
+            _run_embedding_stage(cfg, store, stats, use_external=False, chunk_limit=256)
 
-        stats.duration_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-        return stats
-    finally:
-        try:
-            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
-        except OSError:
-            pass
-        lock_fh.close()
+    stats.duration_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+    return stats

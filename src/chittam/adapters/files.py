@@ -106,6 +106,8 @@ _DOC_PREFIX_BY_MEDIA: dict[MediaType, str] = {
     MediaType.IMAGE: "file_img",
 }
 
+UNREADABLE_IMAGE_SENTINEL = "__CHITTAM_UNREADABLE_IMAGE__"
+
 
 @dataclass
 class FileContext:
@@ -408,6 +410,8 @@ def _handle_image(path: Path, ctx: FileContext) -> DocumentRecord | None:
     if ctx.image_cache_lookup is not None:
         try:
             cached = ctx.image_cache_lookup(img_sha)
+            if cached == UNREADABLE_IMAGE_SENTINEL:
+                return None
             if cached and cached.strip():
                 caption = cached.strip()
                 from_cache = True
@@ -576,6 +580,7 @@ def _check_stat_unchanged(
     cfg: AppConfig,
     *,
     file_stat: os.stat_result | None = None,
+    existing_projects: dict[str, str | None] | None = None,
 ) -> str | None:
     if not existing_stats:
         return None
@@ -593,6 +598,11 @@ def _check_stat_unchanged(
     expected_tier = repo.tier.value if repo else RepoTier.REFERENCE.value
     if prev_tier != expected_tier:
         return None
+
+    if existing_projects is not None and candidate_doc_id in existing_projects:
+        expected_proj = repo.project_id if repo else None
+        if existing_projects[candidate_doc_id] != expected_proj:
+            return None
 
     if spec.media_type == MediaType.IMAGE:
         if not prev_l0 or prev_l0.startswith("[image uncaptioned"):
@@ -704,6 +714,8 @@ def load_file_docs(
     stats: SyncStats | None = None,
     existing_stats: dict[str, tuple[int | None, int | None, str, str, str]] | None = None,
     unchanged_doc_ids: set[str] | None = None,
+    existing_projects: dict[str, str | None] | None = None,
+    unreadable_prefixes: set[str] | None = None,
 ) -> list[DocumentRecord]:
     """Scan cfg.privacy.scan_roots with compiled privacy exclusion, stat() fast-path, and media dispatch."""
     sync_stats = stats if stats is not None else SyncStats()
@@ -785,6 +797,7 @@ def load_file_docs(
             code_counts=code_counts,
             cfg=cfg,
             file_stat=entry_stat,
+            existing_projects=existing_projects,
         )
         if unchanged_id is not None:
             if unchanged_doc_ids is not None:
@@ -815,13 +828,22 @@ def load_file_docs(
             _stamp_file_stat(doc, real_file)
             docs.append(doc)
 
+    def _record_unreadable(path_obj: Path) -> None:
+        if unreadable_prefixes is not None:
+            for candidate in (path_obj, path_obj.resolve(strict=False)):
+                unreadable_prefixes.add(str(candidate).rstrip("/"))
+
     for raw_root in cfg.privacy.scan_roots:
         root = Path(raw_root).expanduser()
         try:
-            if not root.exists() or not root.is_dir():
-                continue
+            exists = root.exists()
+            is_dir = exists and root.is_dir()
             resolved_root = root.resolve(strict=False)
-        except OSError:
+        except OSError as exc:
+            _record_unreadable(root)
+            sync_stats.errors.append(f"scandir {root}: {exc}")
+            continue
+        if not is_dir:
             continue
 
         root_excl, _ = privacy_matcher.check(
@@ -838,6 +860,7 @@ def load_file_docs(
                 with os.scandir(resolved_root) as it:
                     entries = sorted(it, key=lambda e: e.name)
             except OSError as exc:
+                _record_unreadable(resolved_root)
                 sync_stats.errors.append(f"scandir {resolved_root}: {exc}")
                 continue
 
@@ -878,6 +901,7 @@ def load_file_docs(
                 with os.scandir(real_dir) as it:
                     entries = sorted(it, key=lambda e: e.name)
             except OSError as exc:
+                _record_unreadable(real_dir)
                 sync_stats.errors.append(f"scandir {real_dir}: {exc}")
                 continue
 
